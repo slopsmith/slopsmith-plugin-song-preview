@@ -1,6 +1,15 @@
 (function () {
     'use strict';
 
+    // Idempotency guard: slopsmith can re-evaluate a plugin's screen.js
+    // (loader cache miss / desktop hot reload). Without this, every reload
+    // stacks another MutationObserver and capture-phase 'play' listener and
+    // leaks an orphaned <audio> element. Install the page-level hooks exactly
+    // once — the first evaluation stays authoritative; its observer keeps
+    // re-running injectAll() as the library re-renders.
+    if (window.__slopsmithSongPreviewHooksInstalled) return;
+    window.__slopsmithSongPreviewHooksInstalled = true;
+
     const PLUGIN = 'song_preview';
     const API = `/api/plugins/${PLUGIN}`;
 

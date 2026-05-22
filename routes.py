@@ -49,6 +49,19 @@ def _wem_data_to_ogg(wem_data: bytes, out_ogg: Path) -> None:
     from audio import _vgmstream_cmd, _ffmpeg_cmd  # noqa: PLC0415
     vgmstream = _vgmstream_cmd()
     ffmpeg = _ffmpeg_cmd()
+    # Both resolvers return None when the tool isn't on PATH. Without this
+    # guard, subprocess.run([None, ...]) raises a confusing TypeError that
+    # surfaces as a generic 500.
+    if vgmstream is None or ffmpeg is None:
+        missing = ", ".join(
+            name
+            for name, cmd in (("vgmstream-cli", vgmstream), ("ffmpeg", ffmpeg))
+            if cmd is None
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=f"audio decoder unavailable ({missing} not found on PATH)",
+        )
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         wem = tmp_path / "audio.wem"
