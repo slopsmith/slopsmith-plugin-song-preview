@@ -7,7 +7,9 @@ Hear a preview of songs in your library as you hover over them, just as you're u
 
   ### Features & Formats
   *  **Audio Previews:** Instantly hear snippets just by hovering over your tracks.
-  *  **Supported Formats:** `.psarc` files **and** loose song folders. Sloppaks are skipped on purpose for now.
+  *  **Progress Ring:** A clean ring traces the perimeter of the album art as the clip plays, so you can see how much is left at a glance. Auto-matches your theme accent (works great with the [Themes plugin](https://github.com/masc0t/slopsmith-plugin-themes)).
+  *  **Keyboard Friendly:** Arrow-key through the library and the focused card previews automatically — same hover-to-listen behaviour, no mouse required.
+  *  **Supported Formats:** `.psarc` files **and** loose song folders. Sloppak support Coming Soon!™️️
   *  **On/Off Toggle:** Find it in Settings, or under the **Plugins** dropdown at the top. Red = off, green = on. Defaults to on, and your choice survives plugin updates.
   *  **Future Roadmap:** Looking into adding support for the `.sloppak` format down the road.
 
@@ -37,3 +39,6 @@ Hear a preview of songs in your library as you hover over them, just as you're u
   ```bash
   https://github.com/DeathlySin/slopsmith-plugin-song-preview.git
   ```
+
+Great news for you though! Plugin Manager can now find this, so it's easier than ever to install!
+Any issues, please open a PR!

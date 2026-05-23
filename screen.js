@@ -5,219 +5,116 @@
     // (loader cache miss / desktop hot reload). Without this, every reload
     // stacks another MutationObserver and capture-phase 'play' listener and
     // leaks an orphaned <audio> element. Install the page-level hooks exactly
-    // once — the first evaluation stays authoritative; its observer keeps
-    // re-running injectAll() as the library re-renders.
+    // once — the first evaluation stays authoritative.
     if (window.__slopsmithSongPreviewHooksInstalled) return;
     window.__slopsmithSongPreviewHooksInstalled = true;
 
     const PLUGIN = 'song_preview';
     const API = `/api/plugins/${PLUGIN}`;
+    const JS_URL = `${API}/js`;
 
-    const STORAGE_KEY = 'slopsmith_song_preview_enabled';
-    const TOGGLE_IDS = ['song-preview-enabled', 'song-preview-enabled-screen'];
+    // Slopsmith loads exactly one script per plugin (manifest's `script`
+    // field). routes.py serves the rest of the source as static files
+    // under /js/, and we pull them in via dynamic import here.
+    const modules = [
+        'preview-toggle',
+        'menu-gate',
+        'input-tracker',
+        'audio-controller',
+        'progress-scope',
+        'preview-loop',
+    ];
 
-    function isPreviewEnabled() {
-        return localStorage.getItem(STORAGE_KEY) !== 'false';
-    }
+    Promise.all(modules.map(name => import(`${JS_URL}/${name}.js`)))
+        .then(([
+            { PreviewToggle },
+            { MenuGate },
+            { InputTracker },
+            { AudioController },
+            { ProgressScope },
+            { PreviewLoop },
+        ]) => {
+            const toggle = new PreviewToggle();
+            const menu = new MenuGate();
+            const input = new InputTracker();
+            const audio = new AudioController({ apiBase: API, pluginName: PLUGIN });
+            const scope = new ProgressScope(audio);
+            const loop = new PreviewLoop({ toggle, menu, input, audio, scope });
 
-    function setPreviewEnabled(on) {
-        localStorage.setItem(STORAGE_KEY, on ? 'true' : 'false');
-        // Mirror to every known toggle currently in the DOM so the
-        // Settings page and the dedicated screen stay in sync.
-        for (const id of TOGGLE_IDS) {
-            const el = document.getElementById(id);
-            if (el && el.checked !== on) el.checked = on;
-        }
-    }
+            // Per-DOM-tick bindings. The library re-renders often — coalesce
+            // to one inject call per frame.
+            let injectPending = false;
+            const injectAll = () => {
+                toggle.bindDom();
+                menu.bindDom();
+            };
+            const scheduleInject = () => {
+                if (injectPending) return;
+                injectPending = true;
+                requestAnimationFrame(() => {
+                    injectPending = false;
+                    injectAll();
+                });
+            };
 
-    function bindToggles() {
-        for (const id of TOGGLE_IDS) {
-            const el = document.getElementById(id);
-            if (!el || el.dataset.songPreviewBound) continue;
-            el.dataset.songPreviewBound = '1';
-            el.checked = isPreviewEnabled();
-            el.addEventListener('change', () => setPreviewEnabled(el.checked));
-        }
-    }
-
-    // One shared <audio> for the whole page. Starting a new preview kills the old one.
-    let _audio = null;
-    let _loadingFile = null;
-    let _playingFile = null;
-    let _playListenerInstalled = false;
-
-    // Named so teardown() can removeEventListener it.
-    function onDocumentPlay(e) {
-        if (e.target !== _audio) stopPreview();
-    }
-
-    function getAudio() {
-        if (_audio) return _audio;
-        _audio = document.createElement('audio');
-        _audio.preload = 'none';
-        document.body.appendChild(_audio);
-
-        _audio.addEventListener('playing', () => {
-            if (_loadingFile) {
-                _playingFile = _loadingFile;
-                _loadingFile = null;
+            const obs = new MutationObserver((mutations) => {
+                for (const m of mutations) {
+                    if (m.type === 'childList' && (m.addedNodes.length || m.removedNodes.length)) {
+                        // Caches may now point at detached nodes — invalidate
+                        // synchronously before the next rAF tick reads them.
+                        // Inject is coalesced separately.
+                        loop.invalidateCursorCache();
+                        menu.invalidateCache();
+                        scheduleInject();
+                        return;
+                    }
+                }
+            });
+            // Narrow the observer to the card-bearing containers instead of
+            // `body, subtree:true`. The browser's subtree tracking is the
+            // expensive part (it has to register every descendant); limiting
+            // it to the four grids/trees the library actually re-renders
+            // keeps the cost where the mutations are.
+            //
+            // body itself is still observed with subtree:false to catch
+            // screen-level mount/unmount events (settings page, plugin
+            // screens) — those happen as direct children of body and are
+            // rare enough that a shallow observer is essentially free.
+            const cardContainers = ['lib-grid', 'lib-tree', 'fav-grid', 'fav-tree']
+                .map(id => document.getElementById(id))
+                .filter(Boolean);
+            if (cardContainers.length) {
+                for (const el of cardContainers) {
+                    obs.observe(el, { childList: true, subtree: true });
+                }
+                obs.observe(document.body, { childList: true, subtree: false });
+            } else {
+                // Fallback: containers not yet rendered (plugin loaded before
+                // the library HTML). Fall back to the old wide scope.
+                obs.observe(document.body, { childList: true, subtree: true });
             }
-        });
-        _audio.addEventListener('ended', () => {
-            _playingFile = null;
-            _loadingFile = null;
-        });
-        _audio.addEventListener('error', () => {
-            console.warn(`[${PLUGIN}] audio error for`, _loadingFile || _playingFile);
-            _playingFile = null;
-            _loadingFile = null;
-        });
-
-        // If the main app fires up any other audio element, get out of its way.
-        // 'play' doesn't bubble, so listen in the capture phase.
-        if (!_playListenerInstalled) {
-            document.addEventListener('play', onDocumentPlay, true);
-            _playListenerInstalled = true;
-        }
-
-        return _audio;
-    }
-
-    function startPreview(filename) {
-        if (_loadingFile === filename || _playingFile === filename) return;
-        const audio = getAudio();
-
-        // Cut off whatever was playing before.
-        if (_loadingFile || _playingFile) {
-            audio.pause();
-            audio.src = '';
-            _loadingFile = null;
-            _playingFile = null;
-        }
-
-        _loadingFile = filename;
-
-        audio.src = `${API}/audio?file=${encodeURIComponent(filename)}`;
-        audio.play().catch((e) => {
-            // play() often rejects because the user already moved on to another
-            // card. Only clear state if this filename is still the active one.
-            if (_loadingFile === filename || _playingFile === filename) {
-                console.warn(`[${PLUGIN}] play() rejected:`, e);
-                _loadingFile = null;
-                _playingFile = null;
-            }
-        });
-    }
-
-    function stopPreview() {
-        if (!_loadingFile && !_playingFile) return;
-        const audio = getAudio();
-        audio.pause();
-        audio.src = '';
-        _loadingFile = null;
-        _playingFile = null;
-    }
-
-    function attachHover(host, filename) {
-        if (host.dataset.songPreviewHover) return;
-        host.dataset.songPreviewHover = '1';
-
-        let timer = null;
-        host.addEventListener('mouseenter', () => {
-            if (!isPreviewEnabled()) return;
-
-            // The library re-renders cards mid-hover, which can leave a stale
-            // preview playing because the old card's mouseleave never fired.
-            // If a different file is still going, cut it dead now.
-            const active = _loadingFile || _playingFile;
-            if (active && active !== filename) stopPreview();
-
-            // Short debounce so scrolling past cards doesn't fire one request per card.
-            timer = setTimeout(() => {
-                timer = null;
-                startPreview(filename);
-            }, 180);
-        });
-
-        host.addEventListener('mouseleave', () => {
-            if (timer) { clearTimeout(timer); timer = null; }
-            if (_loadingFile === filename || _playingFile === filename) stopPreview();
-        });
-    }
-
-    // data-play holds the DLC-root-relative path (same value the rest of the app uses).
-    function entryFilename(el) {
-        try { return decodeURIComponent(el.dataset.play || ''); }
-        catch (_) { return el.dataset.play || ''; }
-    }
-
-    // Only PSARCs and loose folders get previews. Sloppaks are skipped on purpose.
-    function isPreviewable(fn) {
-        return !!fn && !fn.toLowerCase().endsWith('.sloppak');
-    }
-
-    function injectIntoCard(card) {
-        const fn = entryFilename(card);
-        if (!isPreviewable(fn)) return;
-        attachHover(card, fn);
-    }
-
-    function injectIntoRow(row) {
-        const fn = entryFilename(row);
-        if (!isPreviewable(fn)) return;
-        attachHover(row, fn);
-    }
-
-    function injectAll() {
-        document.querySelectorAll('.song-card').forEach(injectIntoCard);
-        document.querySelectorAll('.song-row[data-play]').forEach(injectIntoRow);
-        bindToggles();
-    }
-
-    // The library re-renders a lot. Coalesce inject calls to one per frame.
-    let _injectPending = false;
-
-    function scheduleInject() {
-        if (_injectPending) return;
-        _injectPending = true;
-        requestAnimationFrame(() => {
-            _injectPending = false;
             injectAll();
+            loop.start();
+
+            // Teardown for when slopsmith unloads the plugin. Reverses
+            // everything the idempotency-guarded install set up so a
+            // subsequent re-evaluation starts from a clean slate.
+            window.__slopsmithSongPreviewTeardown = function teardown() {
+                try { obs.disconnect(); } catch (_) {}
+                loop.destroy();
+                scope.destroy();
+                audio.destroy();
+                input.destroy();
+                menu.destroy();
+                toggle.destroy();
+                delete window.__slopsmithSongPreviewHooksInstalled;
+                delete window.__slopsmithSongPreviewTeardown;
+            };
+        })
+        .catch((err) => {
+            console.error(`[${PLUGIN}] module load failed`, err);
+            // Release the guard so a future re-evaluation can retry rather
+            // than silently no-op'ing forever.
+            delete window.__slopsmithSongPreviewHooksInstalled;
         });
-    }
-
-    const obs = new MutationObserver((mutations) => {
-        for (const m of mutations) {
-            if (m.type === 'childList' && (m.addedNodes.length || m.removedNodes.length)) {
-                scheduleInject();
-                return;
-            }
-        }
-    });
-
-    obs.observe(document.body, { childList: true, subtree: true });
-    injectAll();
-
-    // Teardown for when slopsmith unloads the plugin. Reverses everything the
-    // idempotency-guarded install above set up so a subsequent re-evaluation
-    // starts from a clean slate.
-    window.__slopsmithSongPreviewTeardown = function teardown() {
-        try { obs.disconnect(); } catch (_) {}
-        if (_playListenerInstalled) {
-            document.removeEventListener('play', onDocumentPlay, true);
-            _playListenerInstalled = false;
-        }
-        if (_audio) {
-            try {
-                _audio.pause();
-                _audio.src = '';
-                _audio.remove();
-            } catch (_) {}
-            _audio = null;
-        }
-        _loadingFile = null;
-        _playingFile = null;
-        delete window.__slopsmithSongPreviewHooksInstalled;
-        delete window.__slopsmithSongPreviewTeardown;
-    };
 })();

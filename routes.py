@@ -11,7 +11,7 @@ import threading
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 
 # server.py normally puts lib/ on the path; this is just for direct/reloaded use.
 _LIB = Path(__file__).resolve().parents[2] / "lib"
@@ -235,6 +235,46 @@ def _range_response(path: Path, request: Request) -> StreamingResponse:
 def setup(app: FastAPI, context: dict) -> None:
     global _context
     _context = context
+
+    @app.get("/api/plugins/song_preview/js/{filename}")
+    def get_js(filename: str, request: Request):
+        """Serve modular JS class files from ./js/.
+
+        The host's plugin loader exposes exactly one URL per plugin (the
+        manifest's `script` field). To split screen.js across multiple
+        classes we have to be our own static-file server for the rest.
+        Locked down to bare `.js` filenames inside the js/ subdir — no
+        traversal, no other extensions.
+
+        Strong ETag + `must-revalidate` so the browser always asks but
+        gets a 304 (no body) when the file is unchanged. Cheaper than
+        re-shipping the body on every plugin reload, and doesn't break
+        the dev cycle the way a long `max-age` would.
+        """
+        if not filename.endswith(".js") or "/" in filename \
+                or "\\" in filename or filename.startswith("."):
+            raise HTTPException(status_code=400, detail="invalid filename")
+        js_dir = (Path(__file__).resolve().parent / "js").resolve()
+        target = (js_dir / filename).resolve()
+        try:
+            target.relative_to(js_dir)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="invalid filename")
+        if not target.is_file():
+            raise HTTPException(status_code=404, detail="not found")
+        body = target.read_bytes()
+        etag = '"' + hashlib.sha256(body).hexdigest()[:16] + '"'
+        cache_headers = {
+            "ETag": etag,
+            "Cache-Control": "public, max-age=0, must-revalidate",
+        }
+        if request.headers.get("if-none-match") == etag:
+            return Response(status_code=304, headers=cache_headers)
+        return Response(
+            content=body,
+            media_type="application/javascript",
+            headers=cache_headers,
+        )
 
     @app.get("/api/plugins/song_preview/audio")
     async def get_audio(file: str, request: Request):
