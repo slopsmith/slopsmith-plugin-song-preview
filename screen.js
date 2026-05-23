@@ -44,6 +44,12 @@
     let _audio = null;
     let _loadingFile = null;
     let _playingFile = null;
+    let _playListenerInstalled = false;
+
+    // Named so teardown() can removeEventListener it.
+    function onDocumentPlay(e) {
+        if (e.target !== _audio) stopPreview();
+    }
 
     function getAudio() {
         if (_audio) return _audio;
@@ -69,9 +75,10 @@
 
         // If the main app fires up any other audio element, get out of its way.
         // 'play' doesn't bubble, so listen in the capture phase.
-        document.addEventListener('play', (e) => {
-            if (e.target !== _audio) stopPreview();
-        }, true);
+        if (!_playListenerInstalled) {
+            document.addEventListener('play', onDocumentPlay, true);
+            _playListenerInstalled = true;
+        }
 
         return _audio;
     }
@@ -190,4 +197,27 @@
 
     obs.observe(document.body, { childList: true, subtree: true });
     injectAll();
+
+    // Teardown for when slopsmith unloads the plugin. Reverses everything the
+    // idempotency-guarded install above set up so a subsequent re-evaluation
+    // starts from a clean slate.
+    window.__slopsmithSongPreviewTeardown = function teardown() {
+        try { obs.disconnect(); } catch (_) {}
+        if (_playListenerInstalled) {
+            document.removeEventListener('play', onDocumentPlay, true);
+            _playListenerInstalled = false;
+        }
+        if (_audio) {
+            try {
+                _audio.pause();
+                _audio.src = '';
+                _audio.remove();
+            } catch (_) {}
+            _audio = null;
+        }
+        _loadingFile = null;
+        _playingFile = null;
+        delete window.__slopsmithSongPreviewHooksInstalled;
+        delete window.__slopsmithSongPreviewTeardown;
+    };
 })();

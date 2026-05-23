@@ -25,6 +25,9 @@ _cache_dir: Path | None = None
 _transcode_locks: dict[str, threading.Lock] = {}
 _locks_mutex = threading.Lock()
 
+# Cap the OGG cache. Without this, the directory grows one file per song forever.
+_CACHE_MAX_BYTES = 256 * 1024 * 1024
+
 
 def _get_cache_dir() -> Path:
     global _cache_dir
@@ -42,6 +45,41 @@ def _transcode_lock(key: str) -> threading.Lock:
         if key not in _transcode_locks:
             _transcode_locks[key] = threading.Lock()
         return _transcode_locks[key]
+
+
+def _evict_cache(max_bytes: int = _CACHE_MAX_BYTES) -> None:
+    """Bound the OGG cache by deleting the oldest entries until under max_bytes."""
+    try:
+        entries: list[tuple[float, int, Path]] = []
+        total = 0
+        for p in _get_cache_dir().glob("*.ogg"):
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            entries.append((st.st_mtime, st.st_size, p))
+            total += st.st_size
+        if total <= max_bytes:
+            return
+        entries.sort(key=lambda e: e[0])
+        for _, size, p in entries:
+            if total <= max_bytes:
+                break
+            try:
+                p.unlink()
+                total -= size
+            except OSError:
+                pass
+    except Exception as e:
+        print(f"[song_preview] cache eviction failed: {e}")
+
+
+def _touch_cache_entry(path: Path) -> None:
+    # Bumps mtime so LRU eviction keeps the recently-used entries.
+    try:
+        os.utime(path, None)
+    except OSError:
+        pass
 
 
 def _wem_data_to_ogg(wem_data: bytes, out_ogg: Path) -> None:
@@ -101,6 +139,7 @@ def _psarc_preview_ogg(psarc_path: Path) -> Path:
     lock = _transcode_lock(cache_key)
     with lock:
         if out.exists() and out.stat().st_size > 1000:
+            _touch_cache_entry(out)
             return out
 
         from psarc import read_psarc_entries  # noqa: PLC0415
@@ -109,6 +148,7 @@ def _psarc_preview_ogg(psarc_path: Path) -> Path:
             if wems:
                 chosen = min(wems.keys(), key=lambda n: len(wems[n]))
                 _wem_data_to_ogg(wems[chosen], out)
+                _evict_cache()
                 return out
         except Exception as e:
             print(f"[song_preview] read_psarc_entries failed ({e}), falling back to unpack")
@@ -121,6 +161,7 @@ def _psarc_preview_ogg(psarc_path: Path) -> Path:
             if not wem_files:
                 raise HTTPException(status_code=404, detail="No audio found in PSARC")
             _wem_data_to_ogg(wem_files[0].read_bytes(), out)
+            _evict_cache()
 
     return out
 
@@ -131,12 +172,14 @@ def _loose_preview_ogg(folder: Path) -> Path:
     lock = _transcode_lock(cache_key)
     with lock:
         if out.exists() and out.stat().st_size > 1000:
+            _touch_cache_entry(out)
             return out
         # Smallest WEM is the preview clip; larger ones are full-song stems.
         wems = sorted(folder.rglob("*.wem"), key=lambda p: p.stat().st_size)
         if not wems:
             raise HTTPException(status_code=404, detail="No audio found in loose folder")
         _wem_data_to_ogg(wems[0].read_bytes(), out)
+        _evict_cache()
     return out
 
 
@@ -236,7 +279,8 @@ def setup(app: FastAPI, context: dict) -> None:
         except HTTPException:
             raise
         except Exception as e:
+            # Keep the detail in server logs; don't echo raw exception text to the client.
             print(f"[song_preview] audio preparation failed for {file!r}: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise HTTPException(status_code=500, detail="audio preparation failed")
 
         return _range_response(ogg, request)
