@@ -15,13 +15,90 @@
 
 const API_BASE = '/api/plugins/song_preview';
 const POLL_INTERVAL_MS = 500;
+// Per-file progress poll cadence while a single fix is in flight. Faster than
+// the Fix-All status poll because a single fix is short — we want the bar to
+// catch each stage transition without a visible lag.
+const PROGRESS_POLL_MS = 350;
 // Dataset key marking cards/rows we've already injected a Fix button
 // into. Value is the filename so we can detect "the data-play changed
 // underneath us" (infinite scroll re-uses card nodes).
 const BUTTON_FLAG = 'songPreviewFixBtn';
 
+// ── Tailwind backfill ───────────────────────────────────────────────────
+//
+// The host serves a prebuilt, purged tailwind.min.css. Its content globs
+// (slopsmith tailwind.config.js) scan plugin *.html and screen.js but NOT
+// the js/ modules, and its safelist omits opacity modifiers (`/20`),
+// hover/focus variants, and arbitrary values (`[28rem]`). Every such class
+// used by this module's markup — the Fix buttons, source pills, list/card
+// chrome — plus a handful on the settings page is therefore absent from the
+// shipped CSS, leaving the UI unstyled (the symptom that reads as "buttons
+// don't work"). We re-supply the exact dropped declarations here, injected
+// document-wide so the library-card / -row Fix buttons (which live outside
+// our screen fragment) are covered too. Same self-contained approach the
+// toggle pill uses in screen.html — the plugin can't assume the host's
+// purge included plugin-only classes. Values mirror Tailwind v3 defaults
+// and the host's `dark` palette (#181830 = dark-600).
+const STYLE_ID = 'song-preview-backfill-styles';
+const BACKFILL_STYLES = `
+.border-accent\\/30{border-color:rgb(64 128 224 / .3)}
+.bg-emerald-900\\/40{background-color:rgb(6 78 59 / .4)}
+.text-emerald-300{color:rgb(110 231 183)}
+.border-emerald-700\\/50{border-color:rgb(4 120 87 / .5)}
+.hover\\:bg-emerald-900\\/30:hover{background-color:rgb(6 78 59 / .3)}
+.bg-emerald-400{background-color:rgb(52 211 153)}
+.bg-yellow-900\\/40{background-color:rgb(113 63 18 / .4)}
+.border-yellow-700\\/50{border-color:rgb(161 98 7 / .5)}
+.hover\\:bg-yellow-900\\/30:hover{background-color:rgb(113 63 18 / .3)}
+.bg-yellow-500\\/20{background-color:rgb(234 179 8 / .2)}
+.hover\\:bg-yellow-500\\/20:hover{background-color:rgb(234 179 8 / .2)}
+.hover\\:bg-yellow-500\\/30:hover{background-color:rgb(234 179 8 / .3)}
+.border-yellow-500\\/30{border-color:rgb(234 179 8 / .3)}
+.border-yellow-500\\/40{border-color:rgb(234 179 8 / .4)}
+.text-yellow-400\\/60{color:rgb(250 204 21 / .6)}
+.border-red-700\\/50{border-color:rgb(185 28 28 / .5)}
+.text-red-300\\/80{color:rgb(252 165 165 / .8)}
+.h-1\\.5{height:.375rem}
+.w-2\\.5{width:.625rem}
+.h-2\\.5{height:.625rem}
+.w-3\\.5{width:.875rem}
+.h-3\\.5{height:.875rem}
+.h-12{height:3rem}
+.rounded-md{border-radius:.375rem}
+.ml-2{margin-left:.5rem}
+.pb-4{padding-bottom:1rem}
+.-mt-1{margin-top:-.25rem}
+.my-5{margin-top:1.25rem;margin-bottom:1.25rem}
+.min-w-\\[12rem\\]{min-width:12rem}
+.max-h-\\[28rem\\]{max-height:28rem}
+.leading-relaxed{line-height:1.625}
+.border-dashed{border-style:dashed}
+.list-disc{list-style-type:disc}
+.list-inside{list-style-position:inside}
+.placeholder-gray-500::placeholder{color:rgb(107 114 128)}
+.disabled\\:cursor-not-allowed:disabled{cursor:not-allowed}
+.divide-y>:not([hidden])~:not([hidden]){border-top-width:1px;border-bottom-width:0}
+.divide-dark-600>:not([hidden])~:not([hidden]){border-color:#181830}
+@media (min-width:640px){
+.sm\\:flex-row{flex-direction:row}
+.sm\\:flex-wrap{flex-wrap:wrap}
+.sm\\:items-center{align-items:center}
+}`;
+
+function _ensureStyles() {
+    if (typeof document === 'undefined' || document.getElementById(STYLE_ID)) return;
+    const el = document.createElement('style');
+    el.id = STYLE_ID;
+    el.textContent = BACKFILL_STYLES;
+    document.head.appendChild(el);
+}
+
 export class PreviewBackfill {
     constructor({ audio } = {}) {
+        // Backfill the Tailwind classes the host's purge dropped before any
+        // markup renders, so the very first paint is styled.
+        _ensureStyles();
+
         this._audio = audio || null;
 
         // The audit's view of the world. _entries holds full MissingEntry
@@ -36,6 +113,18 @@ export class PreviewBackfill {
         // the button visual in cards, rows, and list.
         this._fileState = new Map();
         this._fileError = new Map();
+
+        // Determinate progress-bar state for the 'fixing' visual. _fileProgress
+        // is a 0..1 fraction (monotonic — never regresses); _fileStage is the
+        // backend stage name driving the label. Both are painted onto the bar
+        // via direct DOM writes (see _paintProgress/_paintStage) rather than an
+        // innerHTML rebuild, so the bar can update without re-triggering the
+        // library MutationObserver. _progressPolling / _progressTimers track the
+        // per-file poll loops kicked off by backfillOne.
+        this._fileProgress = new Map();
+        this._fileStage = new Map();
+        this._progressPolling = new Set();
+        this._progressTimers = new Map();
 
         // Single-flight guards.
         this._refreshInflight = null;
@@ -124,34 +213,154 @@ export class PreviewBackfill {
 
     async backfillOne(filename) {
         if (this._fileState.get(filename) === 'fixing') return;
+        // Reset the bar to empty and enter the fixing state (renders the
+        // determinate bar at 0%), then start polling the backend for stage
+        // updates. The POST itself is the single blocking call; the poll is
+        // what makes the bar advance through resolve → extract → inject.
+        this._fileProgress.set(filename, 0);
+        this._fileStage.delete(filename);
         this._setFileState(filename, 'fixing');
+        this._startProgressPoll(filename);
+
+        let res;
         try {
-            const res = await fetch(
+            res = await fetch(
                 `${API_BASE}/backfill?file=${encodeURIComponent(filename)}`,
                 { method: 'POST' }
             );
-            if (!res.ok) {
-                let detail = `HTTP ${res.status}`;
-                try {
-                    const body = await res.json();
-                    if (body && body.detail) detail = body.detail;
-                } catch (_) {}
-                throw new Error(detail);
-            }
+        } catch (err) {
+            this._stopProgressPoll(filename);
+            this._failFixing(filename, err);
+            return;
+        }
+        if (!res.ok) {
+            let detail = `HTTP ${res.status}`;
+            try {
+                const body = await res.json();
+                if (body && body.detail) detail = body.detail;
+            } catch (_) {}
+            this._stopProgressPoll(filename);
+            this._failFixing(filename, new Error(detail));
+            return;
+        }
+
+        // Success — drive the bar to 100% and hold a brief "Done" beat so the
+        // completion is visible, then drop the row out of the missing set.
+        this._stopProgressPoll(filename);
+        this._fileProgress.set(filename, 1);
+        this._fileStage.set(filename, 'done');
+        this._paintProgress(filename);
+        this._paintStage(filename);
+        this._completeFixing(filename);
+    }
+
+    _failFixing(filename, err) {
+        console.error('[song_preview] backfill failed', err);
+        this._fileProgress.delete(filename);
+        this._fileStage.delete(filename);
+        this._setFileState(filename, 'error');
+        this._fileError.set(filename, err.message || String(err));
+        this._renderAll();
+    }
+
+    _completeFixing(filename) {
+        // The work is genuinely done; the only reason for the short delay is
+        // so the user sees the bar reach 100% rather than the row vanishing
+        // mid-fill. Not fabricated progress — just a completion beat.
+        setTimeout(() => {
             this._missing.delete(filename);
             this._paired.delete(filename);
             this._entries = this._entries.filter(e => e.filename !== filename);
             this._fileState.delete(filename);
             this._fileError.delete(filename);
+            this._fileProgress.delete(filename);
+            this._fileStage.delete(filename);
             if (this._audio && typeof this._audio.clearNoPreviewMemo === 'function') {
                 this._audio.clearNoPreviewMemo(filename);
             }
             this._renderAll();
-        } catch (err) {
-            console.error('[song_preview] backfill failed', err);
-            this._setFileState(filename, 'error');
-            this._fileError.set(filename, err.message || String(err));
-            this._renderAll();
+        }, 550);
+    }
+
+    // ── Single-fix progress poll ────────────────────────────────────────
+
+    _startProgressPoll(filename) {
+        if (this._progressPolling.has(filename)) return;
+        this._progressPolling.add(filename);
+        const tick = async () => {
+            if (!this._progressPolling.has(filename)) return;
+            try {
+                const res = await fetch(
+                    `${API_BASE}/backfill-progress?file=${encodeURIComponent(filename)}`
+                );
+                if (res.ok) {
+                    const data = await res.json();
+                    this._ingestProgress(filename, data);
+                }
+            } catch (_) { /* transient — keep polling */ }
+            if (this._progressPolling.has(filename)) {
+                this._progressTimers.set(filename, setTimeout(tick, PROGRESS_POLL_MS));
+            }
+        };
+        tick();
+    }
+
+    _stopProgressPoll(filename) {
+        this._progressPolling.delete(filename);
+        const t = this._progressTimers.get(filename);
+        if (t) { clearTimeout(t); this._progressTimers.delete(filename); }
+    }
+
+    // Fold a backend {stage, progress} reading into the bar. Monotonic so a
+    // stale 'idle' read (e.g. right after the entry is cleared) can't drag a
+    // live bar back to 0. Shared by the single-fix poll and the Fix-All status
+    // poll (which reads progress for the song currently being worked on).
+    _ingestProgress(filename, data) {
+        if (data && typeof data.progress === 'number') {
+            const cur = this._fileProgress.get(filename) || 0;
+            this._fileProgress.set(filename, Math.max(cur, data.progress));
+            this._paintProgress(filename);
+        }
+        if (data && data.stage) {
+            this._fileStage.set(filename, data.stage);
+            this._paintStage(filename);
+        }
+    }
+
+    _stageLabel(stage) {
+        switch (stage) {
+            case 'resolving': return 'Preparing&hellip;';
+            case 'extracting': return 'Extracting preview&hellip;';
+            case 'generating': return 'Generating preview&hellip;';
+            case 'injecting': return 'Saving&hellip;';
+            case 'done': return 'Done';
+            default: return 'Fixing preview&hellip;';
+        }
+    }
+
+    // Direct-DOM bar updates. Querying by attribute value (rather than an
+    // innerHTML rebuild) keeps the update off the MutationObserver's childList
+    // radar and lets the inline `transition:width` animate the change. Both
+    // selectors are cheap — only the in-flight fixes carry these attributes.
+    _paintProgress(filename) {
+        const pct = Math.round((this._fileProgress.get(filename) || 0) * 100);
+        for (const el of document.querySelectorAll('[data-fix-progress]')) {
+            if (el.getAttribute('data-fix-progress') === filename) {
+                el.style.width = pct + '%';
+            }
+        }
+    }
+
+    _paintStage(filename) {
+        const label = this._stageLabel(this._fileStage.get(filename));
+        for (const el of document.querySelectorAll('[data-fix-stage]')) {
+            // Only write on a real change — the label updates a handful of
+            // times per fix, but the poll ticks every 350ms, and a redundant
+            // innerHTML write is a childList mutation inside an observed
+            // subtree (cheap to no-op, but pointless to trigger).
+            if (el.getAttribute('data-fix-stage') === filename && el.innerHTML !== label) {
+                el.innerHTML = label;
+            }
         }
     }
 
@@ -176,10 +385,57 @@ export class PreviewBackfill {
                 const res = await fetch(`${API_BASE}/backfill-status`);
                 if (!res.ok) throw new Error(`status ${res.status}`);
                 const state = await res.json();
-                // Mark the currently-being-worked-on file's state so its
-                // card / list row shows a spinner inline with the global
-                // progress bar.
-                if (state.current) this._setFileState(state.current, 'fixing');
+                // Drop songs out of the list as soon as their fix lands,
+                // rather than waiting for the whole run to finish. done_files
+                // is cumulative and lists only successes — errored songs stay
+                // visible so they can be retried. The post-run refresh() below
+                // is still authoritative; this is just the live feedback.
+                if (Array.isArray(state.done_files) && state.done_files.length) {
+                    let removed = false;
+                    for (const f of state.done_files) {
+                        if (!this._missing.has(f)) continue;
+                        this._missing.delete(f);
+                        this._paired.delete(f);
+                        this._entries = this._entries.filter(e => e.filename !== f);
+                        this._fileState.delete(f);
+                        this._fileError.delete(f);
+                        this._fileProgress.delete(f);
+                        this._fileStage.delete(f);
+                        if (this._audio && typeof this._audio.clearNoPreviewMemo === 'function') {
+                            this._audio.clearNoPreviewMemo(f);
+                        }
+                        removed = true;
+                    }
+                    if (removed) this._renderAll();
+                }
+                // Mark every in-flight song as fixing and advance each one's
+                // own card/list bar from its per-file progress. The bulk run
+                // fixes several at once, so there can be more than one; fall
+                // back to `current` for an older backend that only reports one.
+                const inflight = (Array.isArray(state.in_progress) && state.in_progress.length)
+                    ? state.in_progress
+                    : (state.current ? [state.current] : []);
+                // Mark any newly-in-flight songs fixing, then re-render ONCE
+                // (not once per song) so their cards exist before we paint
+                // progress into them below.
+                let stateChanged = false;
+                for (const f of inflight) {
+                    if (this._fileState.get(f) !== 'fixing') {
+                        this._fileState.set(f, 'fixing');
+                        stateChanged = true;
+                    }
+                }
+                if (stateChanged) this._renderAll();
+                // Advance each in-flight song's own bar from its per-file
+                // progress (direct-DOM paint — no re-render needed).
+                for (const f of inflight) {
+                    try {
+                        const pr = await fetch(
+                            `${API_BASE}/backfill-progress?file=${encodeURIComponent(f)}`
+                        );
+                        if (pr.ok) this._ingestProgress(f, await pr.json());
+                    } catch (_) { /* transient — global bar still moves */ }
+                }
                 this._renderProgress(state);
                 if (state.running) {
                     setTimeout(tick, POLL_INTERVAL_MS);
@@ -302,20 +558,20 @@ export class PreviewBackfill {
         const paired = this._paired.size;
         const synth = count - paired;
         if (count === 0) {
-            status.textContent = 'All Sloppaks have previews ✓';
+            status.textContent = 'All songs have a preview ✓';
             status.className = 'text-green-400 flex-1';
             btn.classList.add('hidden');
             return;
         }
-        const lines = [`Sloppaks missing previews: ${count}`];
+        const lines = [`Songs missing a preview: ${count}`];
         if (paired > 0 && synth > 0) {
             lines.push(
-                `${paired} will use a paired PSARC, ${synth} will be generated.`
+                `${paired} will be copied from a PSARC, ${synth} will be generated.`
             );
         } else if (synth > 0) {
-            lines.push('No paired PSARCs found — all will be generated.');
+            lines.push('All will be generated.');
         } else {
-            lines.push('All will use a paired PSARC.');
+            lines.push('All will be copied from a PSARC.');
         }
         status.innerHTML = lines.map(l => `<div>${_escape(l)}</div>`).join('');
         status.className = 'text-gray-400 flex-1';
@@ -335,7 +591,7 @@ export class PreviewBackfill {
             const errBlock = root.querySelector('[data-backfill-errors]');
             const errList = root.querySelector('[data-backfill-errors-list]');
             if (!wrap || !bar || !text) continue;
-            if (state.running || state.done > 0) {
+            if (state.running) {
                 wrap.classList.remove('hidden');
                 const pct = state.total > 0
                     ? Math.round((state.done / state.total) * 100)
@@ -344,6 +600,12 @@ export class PreviewBackfill {
                 text.textContent = state.current
                     ? `${state.done} / ${state.total} — ${state.current}`
                     : `${state.done} / ${state.total}`;
+            } else {
+                // The global bar is only meaningful while a run is in flight.
+                // Hide it once the run ends (or before one starts) so a
+                // finished run doesn't leave a stuck full bar under the
+                // "All songs have a preview" summary.
+                wrap.classList.add('hidden');
             }
             if (btn) btn.disabled = !!state.running;
             if (errBlock && errList) {
@@ -373,11 +635,18 @@ export class PreviewBackfill {
 
         const total = this._entries.length;
         if (total === 0) {
+            // Nothing left to fix — tear down BOTH surfaces. The cards
+            // container was previously left untouched here, so in card layout
+            // the last batch of cards (e.g. a song stuck mid-"Saving…") stayed
+            // on screen after everything was fixed.
+            const cardsContainer = root.querySelector('[data-backfill-cards]');
             list.classList.add('hidden');
+            list.innerHTML = '';
+            cardsContainer?.classList.add('hidden');
+            if (cardsContainer) cardsContainer.innerHTML = '';
             legend.classList.add('hidden');
             controls?.classList.add('hidden');
             empty?.classList.add('hidden');
-            list.innerHTML = '';
             return;
         }
 
@@ -482,36 +751,47 @@ export class PreviewBackfill {
 
     _pillFor(entry) {
         const paired = entry.has_paired_psarc;
+        // Labels describe what WILL happen when the song is fixed, not its
+        // current state — "Generated" (past tense) next to an unfixed song
+        // read as already-done, so these are future/method phrasings.
         return {
             cls: paired
                 ? 'bg-emerald-900/40 text-emerald-300 border border-emerald-700/50'
                 : 'bg-yellow-900/40 text-yellow-300 border border-yellow-700/50',
-            label: paired ? 'PSARC' : 'Generated',
+            label: paired ? 'Copy from PSARC' : 'Generate',
             title: paired
-                ? 'Will lift the original Rocksmith preview out of the paired PSARC'
-                : `Will generate a ${this._previewDurationLabel()} clip from this song's own audio`,
+                ? 'When fixed: copies the ready-made preview clip out of the matching .psarc file (best quality).'
+                : `When fixed: makes a ${this._previewDurationLabel()} clip from the song's own audio.`,
         };
     }
 
     _previewDurationLabel() { return '30s'; }
+
+    // Determinate "fixing" markup: a progress bar the poll drives via the
+    // data-fix-progress hook + a stage label via data-fix-stage. Replaces the
+    // old indeterminate animate-pulse bar so the user sees the fix actually
+    // advance through its stages. Width starts from the cached fraction so a
+    // re-render mid-fix (library re-paint, layout toggle, Fix-All status tick)
+    // keeps the bar where it was rather than snapping back to 0.
+    _fixingMarkup(filename, { wrapClass = 'w-full', barWidth = 'w-full', barClass = 'bg-accent', labelClass = 'text-gray-500' } = {}) {
+        const fn = _escape(filename);
+        const pct = Math.round((this._fileProgress.get(filename) || 0) * 100);
+        const label = this._stageLabel(this._fileStage.get(filename));
+        return `<div class="${wrapClass}">
+                    <div class="${barWidth} h-1.5 bg-dark-500 rounded overflow-hidden">
+                        <div data-fix-progress="${fn}" class="h-full ${barClass}" style="width:${pct}%;transition:width 300ms ease-out"></div>
+                    </div>
+                    <div data-fix-stage="${fn}" class="${labelClass} text-[10px] mt-0.5 text-center">${label}</div>
+                </div>`;
+    }
 
     _actionHtmlFor(entry, variant) {
         // variant is 'list' (small inline button) or 'card' (full-width).
         const state = this._fileState.get(entry.filename) || 'idle';
         if (state === 'fixing') {
             return variant === 'card'
-                ? `<div class="mt-2 w-full">
-                       <div class="w-full h-1.5 bg-dark-500 rounded overflow-hidden">
-                           <div class="h-full bg-accent animate-pulse" style="width: 100%"></div>
-                       </div>
-                       <div class="text-[10px] text-gray-500 mt-0.5 text-center">Fixing&hellip;</div>
-                   </div>`
-                : `<div class="w-24">
-                       <div class="w-full h-1.5 bg-dark-500 rounded overflow-hidden">
-                           <div class="h-full bg-accent animate-pulse" style="width: 100%"></div>
-                       </div>
-                       <div class="text-[10px] text-gray-500 mt-0.5 text-center">Fixing&hellip;</div>
-                   </div>`;
+                ? this._fixingMarkup(entry.filename, { wrapClass: 'mt-2 w-full' })
+                : this._fixingMarkup(entry.filename, { wrapClass: 'w-24' });
         }
         if (state === 'error') {
             const errMsg = this._fileError.get(entry.filename) || 'unknown';
@@ -537,6 +817,20 @@ export class PreviewBackfill {
                 </button>`;
     }
 
+    // Album art for the plugin-screen card view. Reuses the host's per-song
+    // art endpoint — the same URL the library card uses for this sloppak — so
+    // there's nothing to extract plugin-side. Falls back to a music-note
+    // placeholder when the song has no art (endpoint 404s → onerror swap).
+    _artHtml(entry, sizeClasses) {
+        const url = `/api/song/${encodeURIComponent(entry.filename)}/art`;
+        return `<div class="${sizeClasses} flex-shrink-0 rounded-md overflow-hidden bg-dark-800 flex items-center justify-center">
+                    <img src="${_escape(url)}" alt="" loading="lazy"
+                         class="w-full h-full object-cover"
+                         onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">
+                    <span class="text-gray-600" style="display:none;font-size:1.25rem">🎵</span>
+                </div>`;
+    }
+
     _renderListItem(entry) {
         const pill = this._pillFor(entry);
         const action = this._actionHtmlFor(entry, 'list');
@@ -546,7 +840,7 @@ export class PreviewBackfill {
             <li class="flex items-center gap-3 px-3 py-2">
                 <div class="flex-1 min-w-0">
                     <div class="text-sm text-white truncate">${_escape(title)}</div>
-                    <div class="text-[11px] text-gray-500 truncate">${_escape(artist)} &middot; ${_escape(entry.filename)}</div>
+                    <div class="text-[11px] text-gray-500 truncate">${_escape(artist)}</div>
                 </div>
                 <span class="text-[10px] px-1.5 py-0.5 rounded ${pill.cls} whitespace-nowrap"
                       title="${_escape(pill.title)}">${pill.label}</span>
@@ -559,17 +853,18 @@ export class PreviewBackfill {
         const action = this._actionHtmlFor(entry, 'card');
         const title = entry.title || entry.filename;
         const artist = entry.artist || '—';
+        const art = this._artHtml(entry, 'w-12 h-12');
         return `
-            <div class="bg-dark-700/60 border border-dark-600 rounded-lg p-3 flex flex-col">
-                <div class="flex items-start justify-between gap-2 mb-1">
+            <div class="bg-dark-700/60 border border-dark-600 rounded-lg p-3 flex flex-col gap-3">
+                <div class="flex items-center gap-3">
+                    ${art}
                     <div class="min-w-0 flex-1">
                         <div class="text-sm text-white font-medium truncate">${_escape(title)}</div>
                         <div class="text-[11px] text-gray-400 truncate">${_escape(artist)}</div>
+                        <span class="inline-block mt-1 text-[10px] px-1.5 py-0.5 rounded ${pill.cls} whitespace-nowrap"
+                              title="${_escape(pill.title)}">${pill.label}</span>
                     </div>
-                    <span class="text-[10px] px-1.5 py-0.5 rounded ${pill.cls} whitespace-nowrap flex-shrink-0"
-                          title="${_escape(pill.title)}">${pill.label}</span>
                 </div>
-                <div class="text-[10px] text-gray-500 truncate mt-0.5">${_escape(entry.filename)}</div>
                 ${action}
             </div>`;
     }
@@ -662,9 +957,25 @@ export class PreviewBackfill {
     _fillFixUI(wrap, filename, isCard) {
         const state = this._fileState.get(filename) || 'idle';
         const paired = this._paired.has(filename);
+
+        // Render-signature guard. decorate() runs on EVERY MutationObserver
+        // tick, and screen.js observes the library grids with subtree:true.
+        // An unconditional innerHTML write here is itself a childList mutation
+        // inside that observed subtree, so it re-triggers the observer, which
+        // schedules another decorate, which writes again — a per-frame rebuild
+        // loop. A <button> destroyed and recreated between mousedown and
+        // mouseup never emits a click, which is exactly why the library Fix
+        // button looked dead (the plugin screen isn't in the observed subtree,
+        // so its buttons were unaffected). Only touch the DOM when the visible
+        // state actually changes; error text is in the sig so a new error
+        // message still re-renders.
+        const sig = `${state}|${paired}|${isCard}|${this._fileError.get(filename) || ''}`;
+        if (wrap.dataset.fixSig === sig) return;
+        wrap.dataset.fixSig = sig;
+
         const tooltip = paired
-            ? 'Lift the original Rocksmith preview out of the paired PSARC'
-            : `Generate a ${this._previewDurationLabel()} preview from this song's audio`;
+            ? 'Copy the ready-made preview from the matching .psarc file'
+            : `Make a ${this._previewDurationLabel()} preview from the song's own audio`;
 
         // Shared style strings for the row variant. The row button mirrors
         // the format badge's dimensions (px-1.5 py-0.5 text-[10px] font-bold)
@@ -673,17 +984,19 @@ export class PreviewBackfill {
         const fnAttr = _escape(filename);
 
         if (state === 'fixing') {
-            // Inline indeterminate progress bar. Replaces button so
-            // there's nothing to click during the work.
+            // Determinate progress bar (card) / stage-text pill (row). The
+            // bar fills as the backend reports stages — width via the
+            // data-fix-progress hook, label via data-fix-stage. The row has no
+            // room for a bar, so it shows the live stage text instead.
             wrap.innerHTML = isCard
-                ? `<div class="mt-2 w-full">
-                       <div class="w-full h-1.5 bg-dark-500 rounded overflow-hidden">
-                           <div class="h-full bg-yellow-400 animate-pulse" style="width: 100%"></div>
-                       </div>
-                       <div class="mt-1 text-center text-[10px] text-yellow-400/60">Fixing preview&hellip;</div>
-                   </div>`
-                : `<span class="${rowBase} bg-yellow-500/20 border border-yellow-500/40 text-yellow-300 animate-pulse"
-                         title="Fixing preview…">Fixing&hellip;</span>`;
+                ? this._fixingMarkup(filename, {
+                    wrapClass: 'mt-2 w-full',
+                    barClass: 'bg-yellow-400',
+                    labelClass: 'text-yellow-400/60',
+                })
+                : `<span data-fix-stage="${fnAttr}"
+                         class="${rowBase} bg-yellow-500/20 border border-yellow-500/40 text-yellow-300"
+                         title="Fixing preview…">${this._stageLabel(this._fileStage.get(filename))}</span>`;
             return;
         }
         if (state === 'error') {
@@ -719,6 +1032,9 @@ export class PreviewBackfill {
 
     destroy() {
         document.removeEventListener('click', this._onDocClick);
+        document.getElementById(STYLE_ID)?.remove();
+        // Cancel any in-flight single-fix progress polls.
+        for (const filename of [...this._progressPolling]) this._stopProgressPoll(filename);
         for (const el of document.querySelectorAll(`[data-${BUTTON_FLAG}]`)) {
             el.querySelector('[data-fix-missing-preview]')?.remove();
             delete el.dataset[BUTTON_FLAG];

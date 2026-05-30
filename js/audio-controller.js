@@ -8,6 +8,16 @@
 //                                override. Listeners use this for cleanup.
 //   'completed' (file)         — natural 'ended' only. Drives the single-play
 //                                gate so a clip won't immediately replay.
+// Preview volume is persisted as 0..100 (matching Slopsmith's mixer
+// convention) and applied to the preview <audio> as 0..1. It is the plugin's
+// OWN level — deliberately independent of the host Song channel.
+const VOLUME_KEY = 'slopsmith_song_preview_volume';
+const DEFAULT_VOLUME = 0.2;
+// The slider controls loudness only — turning previews OFF is the toggle's job.
+// So volume never reaches 0: it floors at a quiet-but-audible minimum. (Also
+// migrates any stale 0 saved by an earlier build up to the floor.)
+const MIN_VOLUME = 0.05;
+
 export class AudioController {
     constructor({ apiBase, pluginName }) {
         this._apiBase = apiBase;
@@ -30,10 +40,17 @@ export class AudioController {
         // picked up without a page reload.
         this._noPreviewFiles = new Set();
 
-        // Cross-tab live update from Slopsmith's mixer. Same-tab drags
-        // don't fire 'storage' — we also re-read on every start() so the
-        // next hover picks up the new value.
-        this._onStorage = (e) => { if (e.key === 'volume') this._applyVolume(); };
+        // Preview volume is the plugin's own level (see VOLUME_KEY), decoupled
+        // from the host Song channel. Cross-tab drags fire 'storage'; same-tab
+        // changes call setVolume() directly, and start() re-applies it so the
+        // next hover always uses the current level.
+        this._volume = this._loadVolume();
+        this._onStorage = (e) => {
+            if (e.key === VOLUME_KEY) {
+                this._volume = this._loadVolume();
+                this._applyVolume();
+            }
+        };
         window.addEventListener('storage', this._onStorage);
 
         // 'play' doesn't bubble — capture-phase document listener catches
@@ -66,24 +83,28 @@ export class AudioController {
     // hover doesn't bounce off the stale memo.
     clearNoPreviewMemo(filename) { this._noPreviewFiles.delete(filename); }
 
-    // Slopsmith's mixer persists the Song channel as localStorage['volume']
-    // (0..100). audio-mixer.js exposes window.slopsmith.audio.readSongVolume()
-    // which also covers the in-memory fallback used in sandboxed contexts.
-    _getSongVolume() {
+    _loadVolume() {
         try {
-            const api = window.slopsmith && window.slopsmith.audio;
-            if (api && typeof api.readSongVolume === 'function') {
-                const v = api.readSongVolume();
-                if (Number.isFinite(v)) return Math.min(100, Math.max(0, v)) / 100;
-            }
-            const stored = parseFloat(localStorage.getItem('volume'));
-            if (Number.isFinite(stored)) return Math.min(100, Math.max(0, stored)) / 100;
-        } catch (_) { /* ignore */ }
-        return 0.8;
+            const raw = parseFloat(localStorage.getItem(VOLUME_KEY));
+            if (Number.isFinite(raw)) return Math.min(1, Math.max(MIN_VOLUME, raw / 100));
+        } catch (_) { /* sandboxed storage — fall back to default */ }
+        return DEFAULT_VOLUME;
+    }
+
+    // 0..1. Read by PreviewLoop's volume gate and the volume slider UI.
+    getVolume() { return this._volume; }
+
+    // Called by the volume slider. Persists (as 0..100) and applies live so a
+    // drag updates an in-flight preview in real time.
+    setVolume(v) {
+        this._volume = Math.min(1, Math.max(MIN_VOLUME, Number(v) || 0));
+        try { localStorage.setItem(VOLUME_KEY, String(Math.round(this._volume * 100))); }
+        catch (_) { /* sandboxed storage — in-memory only this session */ }
+        this._applyVolume();
     }
 
     _applyVolume() {
-        if (this._audio) this._audio.volume = this._getSongVolume();
+        if (this._audio) this._audio.volume = this._volume;
     }
 
     _ensureAudio() {

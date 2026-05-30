@@ -12,6 +12,7 @@ atomic — a kill mid-injection leaves the original sloppak untouched.
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import logging
 import os
@@ -34,10 +35,45 @@ log = logging.getLogger("slopsmith.plugin.song_preview.backfill")
 PREVIEW_REL = "preview.ogg"
 
 
+def _resolve_within(base: Path, rel: str) -> Path | None:
+    """Join ``base / rel`` and return it only if the result stays inside
+    ``base`` after resolving symlinks; otherwise ``None``.
+
+    Manifests live inside user-supplied sloppaks, so every relative path they
+    declare (stems, arrangements, lyrics, preview) is untrusted input.
+    Rejecting absolute paths and ``..`` stops classic traversal; the
+    resolve()+relative_to() check additionally stops a symlink *inside* the
+    sloppak from pointing at a file *outside* it — without it, a crafted
+    sloppak could read arbitrary host files through the preview/backfill
+    pipeline.
+    """
+    if not isinstance(rel, str) or not rel:
+        return None
+    rp = Path(rel)
+    if rp.is_absolute() or any(part == ".." for part in rp.parts):
+        return None
+    try:
+        base_resolved = base.resolve()
+        target = (base_resolved / rp).resolve()
+        target.relative_to(base_resolved)
+    except (OSError, ValueError):
+        return None
+    return target
+
+
 # ── Discovery ────────────────────────────────────────────────────────────────
 
+# Folder names whose contents are excluded from the audit entirely. These hold
+# built-in content the user didn't add and shouldn't be asked to "fix" — e.g.
+# the bundled tutorial songs under `tutorials-builtin/`. Matched case-
+# insensitively against every path component, so a sloppak at any depth under
+# such a folder is skipped. Add more names here as other built-in dirs appear.
+_IGNORED_DIR_NAMES = {"tutorials-builtin"}
+
+
 def _iter_sloppaks(dlc_root: Path) -> Iterable[Path]:
-    """Yield every sloppak under ``dlc_root`` (zip files and dir-form)."""
+    """Yield every sloppak under ``dlc_root`` (zip files and dir-form),
+    skipping anything inside an ignored built-in folder."""
     if not dlc_root.is_dir():
         return
     for entry in dlc_root.rglob("*.sloppak"):
@@ -46,6 +82,12 @@ def _iter_sloppaks(dlc_root: Path) -> Iterable[Path]:
         # We rely on the rglob result being only paths whose terminal
         # component literally ends in `.sloppak`; both zip-file and
         # directory forms qualify.
+        try:
+            parts = entry.relative_to(dlc_root).parts
+        except ValueError:
+            parts = entry.parts
+        if any(part.lower() in _IGNORED_DIR_NAMES for part in parts):
+            continue
         yield entry
 
 
@@ -290,13 +332,24 @@ def _inject_dir_form(sloppak_dir: Path, ogg_bytes: bytes) -> None:
 
     preview_path = sloppak_dir / PREVIEW_REL
     preview_tmp = preview_path.with_suffix(preview_path.suffix + ".tmp")
-    preview_tmp.write_bytes(ogg_bytes)
-    preview_tmp.replace(preview_path)
-
-    manifest["preview"] = PREVIEW_REL
     mf_tmp = mf_path.with_suffix(mf_path.suffix + ".tmp")
-    mf_tmp.write_text(_dump_manifest(manifest), encoding="utf-8")
-    mf_tmp.replace(mf_path)
+    try:
+        preview_tmp.write_bytes(ogg_bytes)
+        preview_tmp.replace(preview_path)
+
+        manifest["preview"] = PREVIEW_REL
+        mf_tmp.write_text(_dump_manifest(manifest), encoding="utf-8")
+        mf_tmp.replace(mf_path)
+    finally:
+        # A successful replace renames the .tmp away, so these are no-ops on
+        # the happy path; on a mid-write failure they stop a stale .tmp from
+        # lingering inside the user's sloppak directory.
+        for leftover in (preview_tmp, mf_tmp):
+            try:
+                if leftover.exists():
+                    leftover.unlink()
+            except OSError:
+                pass
 
 
 def _inject_zip_form(sloppak_zip: Path, ogg_bytes: bytes) -> None:
@@ -448,13 +501,13 @@ def _read_manifest_text(
             rel = entry.get("file")
             if not rel:
                 continue
-            arr_path = sloppak_path / rel
-            if arr_path.is_file():
+            arr_path = _resolve_within(sloppak_path, rel)
+            if arr_path and arr_path.is_file():
                 arr_blobs[rel] = arr_path.read_bytes()
         lyrics_rel = manifest.get("lyrics")
         if isinstance(lyrics_rel, str) and lyrics_rel:
-            lyrics_path = sloppak_path / lyrics_rel
-            if lyrics_path.is_file():
+            lyrics_path = _resolve_within(sloppak_path, lyrics_rel)
+            if lyrics_path and lyrics_path.is_file():
                 lyrics_blob = lyrics_path.read_bytes()
         return manifest, arr_blobs, lyrics_blob
 
@@ -717,8 +770,8 @@ def _materialise_full_audio(
 
     if full_entry is not None:
         if sloppak_path.is_dir():
-            p = sloppak_path / full_entry
-            if not p.is_file():
+            p = _resolve_within(sloppak_path, full_entry)
+            if not p or not p.is_file():
                 raise RuntimeError(f"full-mix stem {full_entry!r} missing on disk")
             return p
         # Zip form: extract to tmp.
@@ -737,8 +790,8 @@ def _materialise_full_audio(
     stem_paths: list[Path] = []
     for rel in stems:
         if sloppak_path.is_dir():
-            p = sloppak_path / rel
-            if p.is_file():
+            p = _resolve_within(sloppak_path, rel)
+            if p and p.is_file():
                 stem_paths.append(p)
         else:
             zname = rel.replace("\\", "/")
@@ -873,8 +926,18 @@ class BulkState:
     running: bool = False
     total: int = 0
     done: int = 0
+    # `current` is a single representative in-flight song (kept for back-compat);
+    # `in_progress` is the full set being worked on right now. With the bounded
+    # thread pool several run at once, so the UI marks every `in_progress` song
+    # as fixing rather than just one.
     current: str = ""
+    in_progress: list[str] = field(default_factory=list)
     errors: list[dict] = field(default_factory=list)
+    # Filenames fixed successfully so far, cumulative. Lets the UI drop each
+    # song from the missing list the moment its fix lands, instead of waiting
+    # for the whole run to finish. Errored songs are NOT listed here — they
+    # stay visible (in `errors`) so the user can retry them.
+    done_files: list[str] = field(default_factory=list)
     started_at: float = 0.0
     finished_at: float = 0.0
 
@@ -884,18 +947,31 @@ class BulkState:
             "total": self.total,
             "done": self.done,
             "current": self.current,
+            "in_progress": list(self.in_progress),
             "errors": list(self.errors),
+            "done_files": list(self.done_files),
             "started_at": self.started_at,
             "finished_at": self.finished_at,
         }
 
 
+# Parallelism for a Fix-All run. Each song's fix is dominated by ffmpeg /
+# vgmstream subprocesses, which release the GIL while the child runs, so worker
+# threads genuinely overlap across cores. Capped modestly (rather than at full
+# cpu_count) because ffmpeg is itself multi-threaded — a small pool overlaps the
+# process-spawn + I/O + decode without oversubscribing the CPU.
+_BULK_MAX_WORKERS = max(1, min(4, os.cpu_count() or 1))
+
+
 class BulkRunner:
     """Single-flight bulk-backfill executor.
 
-    Only one Fix-All can run at a time; a second start request while
-    one is running is rejected. State is snapshot-readable from any
-    thread (the GET /backfill-status endpoint reads it).
+    Only one Fix-All can run at a time; a second start request while one is
+    running is rejected. The run itself fixes up to ``_BULK_MAX_WORKERS`` songs
+    in parallel via a bounded thread pool. State is snapshot-readable from any
+    thread (the GET /backfill-status endpoint reads it); all mutations are under
+    ``self._lock``, and each song's fix touches only its own files + temp dir,
+    so the parallelism is safe.
     """
 
     def __init__(self) -> None:
@@ -935,22 +1011,45 @@ class BulkRunner:
         entries: list[MissingEntry],
         do_one: Callable[[MissingEntry], None],
     ) -> None:
-        for entry in entries:
+        def work(entry: MissingEntry) -> None:
             with self._lock:
+                self._state.in_progress.append(entry.filename)
                 self._state.current = entry.filename
+            ok, err = True, None
             try:
                 do_one(entry)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 — one bad song mustn't abort the run
+                ok, err = False, e
                 log.warning("backfill failed for %s: %s", entry.filename, e)
-                with self._lock:
+            with self._lock:
+                try:
+                    self._state.in_progress.remove(entry.filename)
+                except ValueError:
+                    pass
+                # Keep `current` pointing at something still in flight.
+                self._state.current = (
+                    self._state.in_progress[0] if self._state.in_progress else ""
+                )
+                if ok:
+                    self._state.done_files.append(entry.filename)
+                else:
                     self._state.errors.append({
                         "filename": entry.filename,
-                        "error": str(e),
+                        "error": str(err),
                     })
-            finally:
-                with self._lock:
-                    self._state.done += 1
+                self._state.done += 1
+
+        # ThreadPoolExecutor's context exit waits for every task, so the run is
+        # complete before we flip running=False. Exceptions are swallowed inside
+        # `work`, so map() never raises.
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=_BULK_MAX_WORKERS,
+            thread_name_prefix="song_preview_backfill",
+        ) as pool:
+            list(pool.map(work, entries))
+
         with self._lock:
             self._state.running = False
             self._state.current = ""
+            self._state.in_progress = []
             self._state.finished_at = time.time()

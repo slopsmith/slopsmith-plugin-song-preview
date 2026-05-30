@@ -24,6 +24,8 @@
         'progress-scope',
         'preview-loop',
         'preview-backfill',
+        'preview-volume',
+        'touch-trigger',
     ];
 
     Promise.all(modules.map(name => import(`${JS_URL}/${name}.js`)))
@@ -35,6 +37,8 @@
             { ProgressScope },
             { PreviewLoop },
             { PreviewBackfill },
+            { PreviewVolume },
+            { TouchTrigger },
         ]) => {
             const toggle = new PreviewToggle();
             const menu = new MenuGate();
@@ -46,12 +50,21 @@
             // files it just fixed, otherwise the hover loop would keep
             // short-circuiting on stale "no preview" state until reload.
             const backfill = new PreviewBackfill({ audio });
+            // Owns the preview-volume slider on both surfaces; reads/writes
+            // `audio`'s own (decoupled) volume and hides itself when `toggle`
+            // is off.
+            const volume = new PreviewVolume({ audio, toggle });
+            // Touch-only graceful degradation: a tap-to-play button per card
+            // where hover can't work. No-op on desktop (gated on a coarse-
+            // pointer/no-hover media query). Reuses audio + the same gates.
+            const touch = new TouchTrigger({ audio, toggle, menu });
 
             // Per-DOM-tick bindings. The library re-renders often — coalesce
             // to one inject call per frame.
             let injectPending = false;
             const injectAll = () => {
                 toggle.bindDom();
+                volume.bindDom();
                 menu.bindDom();
                 // Settings block lives in a screen that mounts/unmounts on
                 // navigation; bindSettings is idempotent (dataset guard).
@@ -60,6 +73,9 @@
                 // tick — re-running on every DOM mutation keeps badges in
                 // sync with infinite-scroll appends and tree expansions.
                 backfill.decorate();
+                // Touch play buttons ride the same tick for the same reason:
+                // stay in sync with infinite-scroll appends / re-renders.
+                touch.decorate();
             };
             const scheduleInject = () => {
                 if (injectPending) return;
@@ -128,6 +144,8 @@
                 menu.destroy();
                 toggle.destroy();
                 backfill.destroy();
+                volume.destroy();
+                touch.destroy();
                 delete window.__slopsmithSongPreviewHooksInstalled;
                 delete window.__slopsmithSongPreviewTeardown;
             };

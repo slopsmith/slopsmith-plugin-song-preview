@@ -30,6 +30,11 @@ _locks_mutex = threading.Lock()
 # Cap the OGG cache. Without this, the directory grows one file per song forever.
 _CACHE_MAX_BYTES = 256 * 1024 * 1024
 
+# Hard cap on a single preview clip we'll read into memory. Real previews are
+# tens of KB to a few MB; anything larger is either malformed or a crafted
+# (zip-bomb-style) sloppak trying to exhaust memory, so we refuse it.
+_MAX_PREVIEW_BYTES = 32 * 1024 * 1024
+
 
 def _get_cache_dir() -> Path:
     global _cache_dir
@@ -215,13 +220,22 @@ def _read_sloppak_preview(sloppak_path: Path) -> bytes | None:
         rel = manifest.get("preview")
         if not isinstance(rel, str) or not rel:
             return None
-        # Defence against `preview: ../foo` in a hand-edited manifest —
-        # we'd otherwise read arbitrary files relative to the sloppak.
+        # Defence against `preview: ../foo` AND a symlink inside the sloppak
+        # pointing outside it — either would otherwise let a crafted sloppak
+        # have us read (and /audio stream straight back) an arbitrary host file.
         rel_p = Path(rel)
         if rel_p.is_absolute() or any(p == ".." for p in rel_p.parts):
             return None
-        target = sloppak_path / rel_p
+        try:
+            base = sloppak_path.resolve()
+            target = (base / rel_p).resolve()
+            target.relative_to(base)
+        except (OSError, ValueError):
+            return None
         if not target.is_file():
+            return None
+        if target.stat().st_size > _MAX_PREVIEW_BYTES:
+            print(f"[song_preview] preview in {sloppak_path.name} exceeds size cap; ignoring")
             return None
         return target.read_bytes()
 
@@ -249,10 +263,16 @@ def _read_sloppak_preview(sloppak_path: Path) -> bytes | None:
             # zipfile uses forward-slash internal paths regardless of OS.
             zip_rel = rel.replace("\\", "/")
             try:
-                with zf.open(zip_rel) as f:
-                    return f.read()
+                info = zf.getinfo(zip_rel)
             except KeyError:
                 return None
+            # Refuse a zip-bomb preview entry before reading it into memory —
+            # check the declared uncompressed size first.
+            if info.file_size > _MAX_PREVIEW_BYTES:
+                print(f"[song_preview] preview in {sloppak_path.name} exceeds size cap; ignoring")
+                return None
+            with zf.open(info) as f:
+                return f.read()
     except (zipfile.BadZipFile, OSError) as e:
         print(f"[song_preview] failed to read sloppak {sloppak_path.name}: {e}")
         return None
@@ -281,6 +301,7 @@ def _sloppak_preview_ogg(sloppak_path: Path) -> Path:
     lock = _transcode_lock(cache_key)
     with lock:
         if out.exists() and out.stat().st_size > 1000:
+            _touch_cache_entry(out)
             return out
 
         data = _read_sloppak_preview(sloppak_path)
@@ -292,10 +313,23 @@ def _sloppak_preview_ogg(sloppak_path: Path) -> Path:
             )
         # Atomic write so a partial-write crash doesn't pollute the cache
         # with a truncated OGG the size-check above would still accept on
-        # the next request.
+        # the next request. The finally clears a leftover .tmp if write/replace
+        # is interrupted — the eviction sweep only matches *.ogg, so a stranded
+        # .ogg.tmp would otherwise linger uncounted.
         tmp = out.with_suffix(out.suffix + ".tmp")
-        tmp.write_bytes(data)
-        tmp.replace(out)
+        try:
+            tmp.write_bytes(data)
+            tmp.replace(out)
+        finally:
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+        # Sloppak previews share the on-disk cache with the PSARC/loose paths,
+        # so they must be subject to the same LRU cap. Without this the (now
+        # most common) sloppak path grows the cache without bound.
+        _evict_cache()
     return out
 
 
@@ -396,6 +430,24 @@ def setup(app: FastAPI, context: dict) -> None:
 
     _bulk_runner = backfill.BulkRunner()
 
+    # Per-file backfill progress, driving the determinate progress bar in the
+    # UI. Keyed by the sloppak relpath (the same value the client passes as
+    # ?file=). A single fix is a handful of discrete blocking steps, not a
+    # streamable byte count, so progress is coarse: each step reports a
+    # stage name + a fraction the bar animates to. Updated from worker threads
+    # (the single-fix executor and BulkRunner both call _do_backfill_one), read
+    # by the /backfill-progress poll — hence the lock.
+    _file_progress: dict[str, dict] = {}
+    _file_progress_lock = threading.Lock()
+
+    def _set_progress(filename: str, stage: str, fraction: float) -> None:
+        with _file_progress_lock:
+            _file_progress[filename] = {"stage": stage, "progress": round(fraction, 3)}
+
+    def _clear_progress(filename: str) -> None:
+        with _file_progress_lock:
+            _file_progress.pop(filename, None)
+
     def _do_backfill_one(entry) -> None:
         """Single-song backfill body shared by /backfill and Fix-All.
 
@@ -406,8 +458,15 @@ def setup(app: FastAPI, context: dict) -> None:
           2. No paired PSARC — synthesize one from the sloppak's own
              full-mix audio. Section-aware start, 28s clip, 1s fades
              (calibrated against `2minutes_p.psarc`).
+
+        Reports coarse progress stages via _set_progress so the UI bar
+        advances through the real work instead of flashing. The long
+        opaque step (transcode / synth) holds at its checkpoint until the
+        next one fires — honest about what's actually known.
         """
-        sloppak_path = _resolve_dlc_path(entry.filename)
+        fn = entry.filename
+        _set_progress(fn, "resolving", 0.08)
+        sloppak_path = _resolve_dlc_path(fn)
         # _find_paired_psarc walks from the sloppak up to the DLC root
         # looking for a same-basename PSARC, so a layout like
         # `dlc/Foo.psarc` + `dlc/sloppak/Foo.sloppak` still pairs.
@@ -415,27 +474,41 @@ def setup(app: FastAPI, context: dict) -> None:
         psarc_path = backfill._find_paired_psarc(sloppak_path, dlc_root)
         with tempfile.TemporaryDirectory(prefix="song_preview_backfill_") as td:
             tmp_dir = Path(td)
+            ogg_bytes = None
             if psarc_path is not None:
-                ogg_bytes = backfill.extract_preview_ogg_from_psarc(
-                    psarc_path, _wem_data_to_ogg, tmp_dir
-                )
-                # Mirror the log line the synthesis path emits so both
-                # branches are visible in the docker logs — otherwise a
-                # PSARC-paired backfill is silent and the only way to
-                # tell which branch ran is to diff the OGG against a
-                # known-good baseline.
-                backfill.log.info(
-                    "built preview for %s: lifted Wwise preview from %s",
-                    sloppak_path.name, psarc_path.name,
-                )
-            else:
+                # A paired PSARC usually carries a ready-made preview clip, but
+                # not always — some only hold the full-song audio. Try to copy
+                # it out; if there's nothing usable in there, fall through to
+                # generating from the song's own audio rather than failing the
+                # whole fix. (The "paired PSARC" hint in the UI is a best guess
+                # from a filename match, not a guarantee the clip exists.)
+                _set_progress(fn, "extracting", 0.45)
+                try:
+                    ogg_bytes = backfill.extract_preview_ogg_from_psarc(
+                        psarc_path, _wem_data_to_ogg, tmp_dir
+                    )
+                    backfill.log.info(
+                        "built preview for %s: copied from paired PSARC %s",
+                        sloppak_path.name, psarc_path.name,
+                    )
+                except Exception as e:
+                    backfill.log.info(
+                        "paired PSARC %s has no usable preview (%s); "
+                        "generating from the song's audio instead",
+                        psarc_path.name, e,
+                    )
+                    ogg_bytes = None
+            if ogg_bytes is None:
                 # Resolve ffmpeg lazily — the audio module owns discovery
                 # (PATH, bundled-binary fallbacks) so we don't duplicate it.
+                _set_progress(fn, "generating", 0.45)
                 from audio import _ffmpeg_cmd  # noqa: PLC0415
                 ogg_bytes, _ = backfill.build_preview_from_full_audio(
                     sloppak_path, _ffmpeg_cmd(), tmp_dir
                 )
+        _set_progress(fn, "injecting", 0.85)
         backfill.inject_preview(sloppak_path, ogg_bytes)
+        _set_progress(fn, "done", 1.0)
 
     @app.get("/api/plugins/song_preview/audit")
     async def get_audit():
@@ -497,6 +570,11 @@ def setup(app: FastAPI, context: dict) -> None:
             # the failure modes here ("no paired PSARC", "PSARC has
             # only one WEM") are actionable for users.
             raise HTTPException(status_code=500, detail=str(e))
+        finally:
+            # The client snaps its bar to 100% on the 200, so dropping the
+            # entry here is safe — and keeps the dict from growing one stale
+            # 'done' record per single fix over a long session.
+            _clear_progress(file)
         return {"ok": True, "filename": file}
 
     @app.post("/api/plugins/song_preview/backfill-all")
@@ -527,6 +605,17 @@ def setup(app: FastAPI, context: dict) -> None:
     def get_backfill_status():
         """Poll-friendly snapshot of the in-flight Fix-All run, if any."""
         return _bulk_runner.state()
+
+    @app.get("/api/plugins/song_preview/backfill-progress")
+    def get_backfill_progress(file: str):
+        """Coarse per-file progress for the single-fix determinate bar.
+
+        Returns the file's current {stage, progress} while a fix runs, or a
+        zeroed idle snapshot if nothing is in flight for it (the client's bar
+        is monotonic, so an idle read never drags a live bar backwards).
+        """
+        with _file_progress_lock:
+            return _file_progress.get(file, {"stage": "idle", "progress": 0})
 
     @app.get("/api/plugins/song_preview/js/{filename}")
     def get_js(filename: str, request: Request):

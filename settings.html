@@ -17,6 +17,11 @@
     .sp-toggle-pill::after { content: ''; position: absolute; top: 2px; left: 2px; width: 20px; height: 20px; background-color: #fff; border: 1px solid rgb(209,213,219); border-radius: 9999px; transition: all 150ms cubic-bezier(0.4,0,0.2,1); }
     .sp-toggle-input:checked + .sp-toggle-pill { background-color: rgb(22,163,74); }
     .sp-toggle-input:checked + .sp-toggle-pill::after { transform: translateX(100%); border-color: #fff; }
+    /* Self-contained range slider — host's prebuilt Tailwind doesn't style
+       native range inputs, and the dark theme needs an accent thumb. */
+    .sp-volume { -webkit-appearance: none; appearance: none; height: 6px; border-radius: 9999px; background: #1e1e3a; outline: none; cursor: pointer; }
+    .sp-volume::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 16px; height: 16px; border-radius: 9999px; background: #4080e0; border: none; cursor: pointer; }
+    .sp-volume::-moz-range-thumb { width: 16px; height: 16px; border-radius: 9999px; background: #4080e0; border: none; cursor: pointer; }
     </style>
 
     <label class="relative inline-flex items-center cursor-pointer">
@@ -24,27 +29,34 @@
         <span class="sp-toggle-pill"></span>
     </label>
 
+    <div id="song-preview-volume-row" class="hidden" style="margin-top:1rem">
+        <label for="song-preview-volume" class="block text-xs text-gray-400 mb-1">Preview volume</label>
+        <div class="flex items-center gap-2" style="max-width:18rem">
+            <span class="text-gray-500" aria-hidden="true" style="font-size:0.95rem">🔊</span>
+            <input type="range" min="5" max="100" value="20" id="song-preview-volume" class="sp-volume"
+                   aria-label="Song preview volume" style="flex:1;min-width:0">
+            <span id="song-preview-volume-readout" class="text-xs text-gray-300" style="min-width:2.75rem;text-align:right">20%</span>
+        </div>
+    </div>
+
     <hr class="border-dark-500 my-5">
 
     <h4 class="text-sm font-semibold text-gray-300 mb-1">Missing Song Previews</h4>
     <p class="text-xs text-gray-500 leading-relaxed mb-3">
-        PSARCs always ship with a Rocksmith-baked preview clip; Sloppaks don't always.
-        This tool finds Sloppaks that do not have a preview and fixes them. Two strategies,
-        picked automatically per song:
+        Some songs don't have a preview clip yet, so nothing plays when you hover over them.
+        This tool creates the missing previews for you, picking the best method automatically:
     </p>
     <ul class="text-xs text-gray-500 leading-relaxed mb-3 space-y-1 list-disc list-inside ml-1">
-        <li><span class="text-gray-300">Paired PSARC</span> &mdash; if the original
-            <code class="text-gray-300">.psarc</code> sits anywhere in your DLC folder, the
-            Wwise-baked preview is lifted out of it. Highest quality &mdash; exactly what
-            Rocksmith would play.</li>
-        <li><span class="text-gray-300">Generated</span> &mdash; if no PSARC is around, a
-            30-second clip is generated from the song's own audio: starts a beat before the
-            first lyric (or first chorus, or loudest 30s window) with a 1-second fade in and
-            out.</li>
+        <li><span class="text-gray-300">Copy from PSARC</span> &mdash; if the song's matching
+            <code class="text-gray-300">.psarc</code> file is in your DLC folder and has a
+            preview clip (most do), that clip is copied over. Best quality.</li>
+        <li><span class="text-gray-300">Generate</span> &mdash; otherwise a 30-second clip is
+            made from the song's own audio (starts near the first vocal or the catchiest part,
+            with a short fade in and out).</li>
     </ul>
     <p class="text-xs text-gray-500 leading-relaxed mb-3">
-        Open <span class="text-gray-300">Song Preview</span> from the Plugins menu for a
-        per-song view with source indicators and individual Fix buttons.
+        Open <span class="text-gray-300">Song Preview</span> from the Plugins menu to see every
+        song, what will happen to each, and fix them one at a time.
     </p>
     <div id="song-preview-backfill" class="text-xs text-gray-400">
         <div data-backfill-status>Scanning library&hellip;</div>
