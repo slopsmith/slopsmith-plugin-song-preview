@@ -20,6 +20,8 @@
 //     is invisible to it; an innerHTML rewrite inside an observed card grid
 //     would re-trigger the observer → re-decorate → rewrite, a per-frame loop.
 
+import { previewableFrom, readFilename, artElement, isGridCard, isV3Card, isDashboardHero, allPreviewableNodes, dashboardPreviewableNodes } from './host-adapter.js';
+
 const STYLE_ID = 'song-preview-touch-styles';
 // Dataset key marking nodes we've injected a play button into. Value is the
 // filename, so a recycled card node (infinite scroll re-uses DOM) whose
@@ -55,6 +57,21 @@ const STYLES = `
     position:static;width:44px;height:44px;margin-left:8px;flex:0 0 auto;
 }
 .sp-touch-play--row svg{width:18px;height:18px}
+/* Compact size, shared by the dashboard tiles and the v3 Songs grid cards so
+   the play button looks identical across both. */
+.sp-touch-play--sm{width:32px;height:32px}
+.sp-touch-play--sm svg{width:15px;height:15px}
+/* Top-left placement for the dashboard "Jump back in!" tiles, whose accuracy /
+   format badges sit along the BOTTOM — keep clear of them. (Songs grid cards
+   keep the default bottom-right corner; their top-left holds the tuning chip.) */
+.sp-touch-play--corner{left:6px;top:6px;right:auto;bottom:auto}
+/* Enlarged tap target around the host's existing ▶ glyph on the Continue/Pick
+   hero card, which we hijack as the preview toggle. Padding grows the hit area;
+   the matching negative margin keeps the glyph's visual position unchanged. */
+.sp-hero-glyph{
+    cursor:pointer;padding:10px;margin:-10px;
+    -webkit-tap-highlight-color:transparent;touch-action:manipulation;
+}
 `;
 
 // Play triangle + stop square, both present in the DOM so the visible one is a
@@ -98,17 +115,35 @@ export class TouchTrigger {
         // One delegate for every button across every card/row — same reason
         // PreviewBackfill uses one: per-button handlers get orphaned when the
         // library rebuilds a container's innerHTML mid-interaction.
+        //
+        // We act on `pointerup`, not `click`: the v3 cards reveal controls on
+        // hover (`group-hover`), and a touchscreen turns the FIRST tap of a
+        // hover element into a "hover" — the click only arrives on the second
+        // tap. Handling pointerup makes a single tap fire the preview, and we
+        // then swallow the follow-up click so it doesn't toggle straight back
+        // off. Both listen in the CAPTURE phase so we beat the host's own play
+        // handler (in v3 it's bound on the `[data-v3-play]` square / the card
+        // <button> our control sits inside — bubble-phase would be too late).
+        this._suppressNextClick = false;
+        this._onPointerUp = (e) => {
+            const btn = e.target.closest('[data-song-preview-play]');
+            if (!btn) return;
+            e.stopPropagation();
+            e.preventDefault();
+            this._suppressNextClick = true;
+            this._handleTap(btn);
+        };
         this._onClick = (e) => {
             const btn = e.target.closest('[data-song-preview-play]');
             if (!btn) return;
-            // The card is the host's own click target (it plays the song).
-            // Slopsmith's handler already ignores clicks inside a <button>,
-            // but stop anyway for capture-phase hosts.
             e.stopPropagation();
             e.preventDefault();
+            // pointerup already handled this tap — just absorb the ghost click.
+            if (this._suppressNextClick) { this._suppressNextClick = false; return; }
             this._handleTap(btn);
         };
-        document.addEventListener('click', this._onClick);
+        document.addEventListener('pointerup', this._onPointerUp, true);
+        document.addEventListener('click', this._onClick, true);
 
         // On touch, PreviewLoop stands down, so nothing notices when the
         // playing song scrolls off-screen — the preview would keep going
@@ -140,7 +175,7 @@ export class TouchTrigger {
         let card = null;
         for (const b of document.querySelectorAll('[data-song-preview-play]')) {
             if (b.getAttribute('data-song-preview-play') === file) {
-                card = b.closest('.song-card, .song-row');
+                card = previewableFrom(b);
                 break;
             }
         }
@@ -167,8 +202,8 @@ export class TouchTrigger {
         if (!this._toggle.isEnabled()) return;
         if (this._menu.isAnyMenuOpen()) return;
 
-        const card = btn.closest('.song-card[data-play], .song-row[data-play]');
-        const filename = this._readFilename(card);
+        const card = previewableFrom(btn);
+        const filename = readFilename(card);
         if (!filename) return;
 
         // Tap the playing card again → stop. Tap a different card → switch
@@ -182,14 +217,6 @@ export class TouchTrigger {
         }
     }
 
-    _readFilename(card) {
-        if (!card) return null;
-        const raw = card.getAttribute('data-play') || '';
-        if (!raw) return null;
-        try { return decodeURIComponent(raw); }
-        catch (_) { return raw; }
-    }
-
     // Reflect playback state onto buttons by class toggle (attribute write —
     // invisible to the childList MutationObserver). `playingFile` is the
     // decoded filename now playing, or null when nothing is.
@@ -197,8 +224,63 @@ export class TouchTrigger {
         for (const btn of document.querySelectorAll('[data-song-preview-play]')) {
             const fn = btn.getAttribute('data-song-preview-play');
             const on = !!playingFile && fn === playingFile;
-            btn.classList.toggle('is-playing', on);
-            btn.setAttribute('aria-label', on ? 'Stop preview' : 'Play preview');
+            if (btn.dataset.spHijacked !== undefined) {
+                // Hijacked host ▶ glyph — swap the glyph instead of the icon CSS.
+                this._syncHeroGlyph(btn, on);
+            } else {
+                btn.classList.toggle('is-playing', on);
+                btn.setAttribute('aria-label', on ? 'Stop preview' : 'Play preview');
+            }
+        }
+    }
+
+    // Find the host's play affordance on a hero card: an already-hijacked glyph,
+    // else the direct-child <span> whose text is the ▶ play triangle.
+    _findHeroGlyph(node) {
+        const spans = node.querySelectorAll(':scope > span');
+        for (const s of spans) { if (s.dataset.spHijacked !== undefined) return s; }
+        for (const s of spans) {
+            const t = (s.dataset.spOrig != null ? s.dataset.spOrig : s.textContent).trim();
+            if (t === '▶') return s;
+        }
+        return null;
+    }
+
+    // Reflect playback state on the hijacked glyph: ■ while previewing, the
+    // original ▶ otherwise. Guarded so it only writes on an actual change (the
+    // write is a childList mutation the bootstrap observer would otherwise loop on).
+    _syncHeroGlyph(glyph, on) {
+        const orig = glyph.dataset.spOrig != null ? glyph.dataset.spOrig : '▶';
+        const want = on ? '■' : orig;
+        if (glyph.textContent !== want) glyph.textContent = want;
+        glyph.setAttribute('aria-label', on ? 'Stop preview' : 'Play preview');
+    }
+
+    // Turn the host's existing ▶ glyph into the preview toggle (idempotent).
+    _hijackHeroPlay(node, filename, active) {
+        const glyph = this._findHeroGlyph(node);
+        if (!glyph) return;
+        if (glyph.dataset.spHijacked !== filename) {
+            if (glyph.dataset.spOrig == null) glyph.dataset.spOrig = glyph.textContent;
+            glyph.dataset.spHijacked = filename;
+            glyph.setAttribute('data-song-preview-play', filename);
+            glyph.setAttribute('role', 'button');
+            glyph.classList.add('sp-hero-glyph');
+            glyph.tabIndex = -1;
+        }
+        this._syncHeroGlyph(glyph, filename === active);
+    }
+
+    // Undo every hijack — restore the original ▶ text and strip our hooks.
+    _restoreHijacked() {
+        for (const g of document.querySelectorAll('[data-sp-hijacked]')) {
+            if (g.dataset.spOrig != null) g.textContent = g.dataset.spOrig;
+            g.classList.remove('sp-hero-glyph');
+            g.removeAttribute('data-song-preview-play');
+            g.removeAttribute('role');
+            g.removeAttribute('aria-label');
+            delete g.dataset.spHijacked;
+            delete g.dataset.spOrig;
         }
     }
 
@@ -217,12 +299,18 @@ export class TouchTrigger {
         this._ensureStyles();
 
         const active = this._audio.currentFile();
-        const nodes = document.querySelectorAll(
-            '.song-card[data-play], .song-row[data-play]'
-        );
+        // Library cards/rows (also fed to the Fix-badge decorator) PLUS the v3
+        // dashboard tiles (touch-only here — no Fix badge on the dashboard).
+        const nodes = [...allPreviewableNodes(), ...dashboardPreviewableNodes()];
         for (const node of nodes) {
-            const filename = this._readFilename(node);
+            const filename = readFilename(node);
             if (!filename) continue;
+            // Hero card (Continue Playing / Pick a song): don't inject our own
+            // button — hijack the host's existing ▶ glyph as the preview toggle.
+            if (isDashboardHero(node)) {
+                this._hijackHeroPlay(node, filename, active);
+                continue;
+            }
             const current = node.dataset[FLAG];
             if (current === filename) {
                 // Same node, same file — just keep the icon honest in case
@@ -239,10 +327,31 @@ export class TouchTrigger {
     }
 
     _attach(node, filename, playing) {
-        const isCard = node.classList.contains('song-card');
-        const btn = document.createElement('button');
-        btn.type = 'button';
-        btn.className = 'sp-touch-play' + (isCard ? '' : ' sp-touch-play--row') + (playing ? ' is-playing' : '');
+        const isCard = isGridCard(node);
+        const recent = !!(node.hasAttribute && node.hasAttribute('data-recent'));
+        const v3 = isV3Card(node);
+        // Compact 32px button on every v3 surface (Songs grid cards, the thin v3
+        // tree/list rows — a 44px button would be taller than the row — and the
+        // dashboard tiles) so it matches across all of them. v2 stays 44px.
+        // Dashboard "Jump back in!" tiles also move top-left (`--corner`) to clear
+        // their bottom-edge badges; Songs grid cards stay bottom-right (their
+        // top-left holds the tuning chip).
+        const small = recent || v3;
+        const corner = recent;
+        // A <span role="button">, NOT a <button>: some hosts (the v3 dashboard
+        // recently-played tiles) ARE <button> elements, and a <button> nested
+        // inside a <button> is invalid and flaky. A span nests safely everywhere
+        // and — being purely class-styled and driven by the document-level
+        // pointerup/click delegate — behaves identically. Touch-only, so native
+        // button keyboard semantics aren't lost.
+        const btn = document.createElement('span');
+        btn.setAttribute('role', 'button');
+        btn.tabIndex = -1;
+        btn.className = 'sp-touch-play'
+            + (isCard ? '' : ' sp-touch-play--row')
+            + (small ? ' sp-touch-play--sm' : '')
+            + (corner ? ' sp-touch-play--corner' : '')
+            + (playing ? ' is-playing' : '');
         btn.setAttribute('data-song-preview-play', filename);
         btn.setAttribute('aria-label', playing ? 'Stop preview' : 'Play preview');
         btn.innerHTML = ICONS;
@@ -250,17 +359,23 @@ export class TouchTrigger {
         btn.addEventListener('keydown', (e) => e.stopPropagation());
 
         if (isCard) {
-            // Overlay on the album art, like a typical play button. The
-            // ProgressScope ring also lives in .card-art (pointer-events:none),
-            // so it draws around the button without intercepting taps.
-            const art = node.querySelector('.card-art');
+            // Overlay on the album art (v2 `.card-art` / v3 `[data-v3-play]`
+            // square / dashboard tile art), like a typical play button. The
+            // ProgressScope ring also lives in that same surface
+            // (pointer-events:none), so it draws around the button without
+            // intercepting taps.
+            const art = artElement(node);
             if (!art) return; // no art surface — skip silently
             if (getComputedStyle(art).position === 'static') art.style.position = 'relative';
             art.appendChild(btn);
         } else {
-            // Rows have no art; sit inline beside the title, where the format
-            // badge / backfill button already live.
-            const titleContainer = node.querySelector(':scope > .flex-1');
+            // Rows have no art; sit inline beside the existing badges. v2 rows
+            // nest title + format in a neutral `.flex-1` container we sit inside.
+            // v3 tree rows have NO such container — their `.flex-1` IS the
+            // clickable title (a [data-v3-play] span), so append to the row
+            // itself, where the button lands after the favourite button as a
+            // sibling flex item.
+            const titleContainer = v3 ? null : node.querySelector(':scope > .flex-1');
             (titleContainer || node).appendChild(btn);
         }
     }
@@ -270,10 +385,13 @@ export class TouchTrigger {
             node.querySelector('[data-song-preview-play]')?.remove();
             delete node.dataset[FLAG];
         }
+        // Hero glyphs are hijacked in place (not injected), so restore them too.
+        this._restoreHijacked();
     }
 
     destroy() {
-        document.removeEventListener('click', this._onClick);
+        document.removeEventListener('pointerup', this._onPointerUp, true);
+        document.removeEventListener('click', this._onClick, true);
         document.removeEventListener('scroll', this._onScroll, { capture: true });
         if (this._scrollRaf) { cancelAnimationFrame(this._scrollRaf); this._scrollRaf = 0; }
         if (this._mql.removeEventListener) this._mql.removeEventListener('change', this._onMqlChange);

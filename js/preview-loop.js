@@ -15,6 +15,8 @@
 //     the truth. We don't touch focus.
 // Decoupling target from focus means previews still behave correctly even
 // if focus() calls fail silently or the host re-focuses things itself.
+import { previewableFrom, readFilename } from './host-adapter.js';
+
 export class PreviewLoop {
     constructor({ toggle, menu, input, audio, scope }) {
         this._toggle = toggle;
@@ -24,7 +26,6 @@ export class PreviewLoop {
         this._scope = scope;
 
         this.DEBOUNCE_MS = 180;
-        this.PREVIEWABLE_SELECTOR = '.song-card, .song-row[data-play]';
 
         this._candidateTarget = null;
         this._candidateSince = 0;
@@ -81,14 +82,6 @@ export class PreviewLoop {
         this._candidateSince = 0;
     }
 
-    _readPlayFilename(card) {
-        let fn = '';
-        try { fn = decodeURIComponent(card.dataset.play || ''); }
-        catch (_) { fn = card.dataset.play || ''; }
-        if (!fn) return null;
-        return fn;
-    }
-
     _whatsUnderCursor() {
         if (!this._input.hasMousePosition()) return null;
         const x = this._input.mouseX();
@@ -97,8 +90,8 @@ export class PreviewLoop {
             return this._cursorCacheResult;
         }
         const el = document.elementFromPoint(x, y);
-        const card = el ? el.closest(this.PREVIEWABLE_SELECTOR) : null;
-        const fn = card ? this._readPlayFilename(card) : null;
+        const card = el ? previewableFrom(el) : null;
+        const fn = card ? readFilename(card) : null;
         const result = fn ? { fn, card } : null;
         this._cursorCacheX = x;
         this._cursorCacheY = y;
@@ -118,10 +111,10 @@ export class PreviewLoop {
     // in keyboard mode — the host's arrow-key nav moves focus, we read it.
     _getFocusedTarget() {
         const ae = document.activeElement;
-        if (!ae || typeof ae.closest !== 'function') return null;
-        const card = ae.closest(this.PREVIEWABLE_SELECTOR);
-        if (!card || !card.dataset.play) return null;
-        const fn = this._readPlayFilename(card);
+        if (!ae) return null;
+        const card = previewableFrom(ae);
+        if (!card) return null;
+        const fn = readFilename(card);
         return fn ? { fn, card } : null;
     }
 
@@ -145,9 +138,7 @@ export class PreviewLoop {
     _mirrorCursorVisual(cur) {
         const ae = document.activeElement;
         if (this._focusIsHeldByInput(ae)) return;
-        const aeCard = ae && typeof ae.closest === 'function'
-            ? ae.closest(this.PREVIEWABLE_SELECTOR)
-            : null;
+        const aeCard = ae ? previewableFrom(ae) : null;
         if (cur) {
             if (aeCard !== cur.card) {
                 try { cur.card.focus({ preventScroll: true }); }

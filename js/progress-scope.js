@@ -9,9 +9,14 @@
 // same loop visual, just a long thin rectangle instead of a square. Both
 // also get a `song-preview-playing` class so the active item can be tinted
 // (a thin perimeter alone is easy to miss on a dense list).
+import { artElement, isGridCard } from './host-adapter.js';
+
 const PLAYING_STYLE_ID = 'song-preview-playing-styles';
+// v2 list rows are `.song-row`; v3 (#v3-songs) tree rows are `[data-fn]` nodes
+// inside #v3-songs-tree. Tint both the same way so the sounding row stands out.
 const PLAYING_STYLES = `
-.song-row.song-preview-playing{
+.song-row.song-preview-playing,
+#v3-songs-tree [data-fn].song-preview-playing{
     background: rgba(64, 128, 224, 0.14);
     box-shadow: inset 3px 0 0 rgb(var(--sm-accent, 64, 128, 224));
 }`;
@@ -172,12 +177,13 @@ export class ProgressScope {
 
     attach(host) {
         this.detach();
-        // Cards trace their album-art square; rows have no art, so trace the
-        // row's own rounded rect.
-        let art = host && host.querySelector ? host.querySelector('.card-art') : null;
-        if (!art && host && host.classList && host.classList.contains('song-row')) {
-            art = host;
-        }
+        // Cards trace their album-art square (v2 `.card-art` / v3 `[data-v3-play]`
+        // div); rows have no art, so trace the row's own rounded rect. The
+        // adapter returns null for rows — fall back to the host there. A grid
+        // card with no resolvable art square is mid-render: skip it (the next
+        // tick re-attaches), so we never paint a ring around the whole card.
+        let art = artElement(host);
+        if (!art && host && !isGridCard(host)) art = host;
         if (!art) return; // nothing paintable (e.g. a card mid-render)
 
         // Tint the playing item so it's obvious which one is sounding.

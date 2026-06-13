@@ -6,6 +6,15 @@ Hear a preview of songs in your library as you browse them. On desktop, just hov
 
 ---
 
+## ✨ New in 2.2
+
+* **Works on Slopsmith v0.3.0 ("fee[dB]ack")** — the redesigned UI added a brand-new **Songs** library screen with different internals. Song Preview now runs on it: hover-to-listen, the progress trace, "now playing" highlight, touch play buttons, and per-card **Fix** all work on both the classic UI and the new one — no setup, it just detects which library it's looking at.
+
+
+* **Heads up though, this plugin *WILL* be dropping support for versions below v0.3.0+ in the near future, so make sure you update to v0.3.0!**
+
+---
+
 ## ✨ New in 2.0
 
 * **Fix Missing Previews** — find every song without a preview and back-fill them in one click.

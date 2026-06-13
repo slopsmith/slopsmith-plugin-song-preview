@@ -13,6 +13,28 @@
     const API = `/api/plugins/${PLUGIN}`;
     const JS_URL = `${API}/js`;
 
+    // Plugin version, stamped onto the [data-song-preview-version] placeholders
+    // in the plugin screen header and the Settings section. Sourced once from
+    // /api/plugins — the manifest version the host already surfaces (the same
+    // place the v3 Plugins page reads it) — so it never drifts from plugin.json.
+    // Best-effort: if the fetch fails the placeholders just stay empty.
+    let pluginVersion = null;
+    const stampVersion = () => {
+        if (!pluginVersion) return;
+        const text = `v${pluginVersion}`;
+        for (const el of document.querySelectorAll('[data-song-preview-version]')) {
+            if (el.textContent !== text) el.textContent = text;
+        }
+    };
+    fetch('/api/plugins')
+        .then(r => (r.ok ? r.json() : null))
+        .then(list => {
+            const arr = Array.isArray(list) ? list : (list && list.plugins) || [];
+            const entry = arr.find(p => p && p.id === PLUGIN);
+            if (entry && entry.version) { pluginVersion = entry.version; stampVersion(); }
+        })
+        .catch(() => { /* version stamp is best-effort */ });
+
     // Slopsmith loads exactly one script per plugin (manifest's `script`
     // field). routes.py serves the rest of the source as static files
     // under /js/, and we pull them in via dynamic import here.
@@ -76,6 +98,9 @@
                 // Touch play buttons ride the same tick for the same reason:
                 // stay in sync with infinite-scroll appends / re-renders.
                 touch.decorate();
+                // Re-apply the version stamp so it lands whenever the screen or
+                // Settings section (re)mounts. Idempotent + cheap.
+                stampVersion();
             };
             const scheduleInject = () => {
                 if (injectPending) return;
@@ -109,7 +134,15 @@
             // screen-level mount/unmount events (settings page, plugin
             // screens) — those happen as direct children of body and are
             // rare enough that a shallow observer is essentially free.
-            const cardContainers = ['lib-grid', 'lib-tree', 'fav-grid', 'fav-tree']
+            //
+            // `v3-songs` / `v3-home` are the v0.3.0 ("fee[dB]ack") Songs and
+            // dashboard screen wrappers. Both exist in static/v3/index.html from
+            // boot (even before their contents render), and every card mutation
+            // — the lazy first render, infinite-scroll appends, dashboard widget
+            // re-renders — happens inside them, so observing them subtree:true
+            // keeps the per-tick inject (Fix badges + touch buttons) in sync.
+            // Absent on a v2 host, so harmless.
+            const cardContainers = ['lib-grid', 'lib-tree', 'fav-grid', 'fav-tree', 'v3-songs', 'v3-home']
                 .map(id => document.getElementById(id))
                 .filter(Boolean);
             if (cardContainers.length) {

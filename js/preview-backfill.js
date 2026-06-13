@@ -13,6 +13,8 @@
 // triggered from any surface updates the others without explicit
 // coordination.
 
+import { readFilename, isGridCard, isV3Card, allPreviewableNodes } from './host-adapter.js';
+
 const API_BASE = '/api/plugins/song_preview';
 const POLL_INTERVAL_MS = 500;
 // Per-file progress poll cadence while a single fix is in flight. Faster than
@@ -879,18 +881,13 @@ export class PreviewBackfill {
             }
             return;
         }
-        const nodes = document.querySelectorAll(
-            '.song-card[data-play], .song-row[data-play]'
-        );
+        const nodes = allPreviewableNodes();
         for (const node of nodes) {
-            const encoded = node.getAttribute('data-play') || '';
-            if (!encoded.toLowerCase().includes('.sloppak')) continue;
-            let filename;
-            try {
-                filename = decodeURIComponent(encoded);
-            } catch (_) {
-                continue;
-            }
+            const filename = readFilename(node);
+            // The inline Fix badge is only offered for sloppaks (the audit's
+            // copy-from-psarc / generate path keys on them); fast-skip anything
+            // else before the membership test.
+            if (!filename || !filename.toLowerCase().includes('.sloppak')) continue;
             const shouldShow = this._missing.has(filename);
             const currentFile = node.dataset[BUTTON_FLAG];
             if (shouldShow) {
@@ -913,14 +910,23 @@ export class PreviewBackfill {
     }
 
     _attachFixUI(node, filename) {
-        const isCard = node.classList.contains('song-card');
+        const isCard = isGridCard(node);
         const wrap = document.createElement('div');
         wrap.setAttribute('data-fix-missing-preview', filename);
         // Cards: full-width block beneath the tags. Rows: flex child
         // sitting next to the format (STEMS / SLOPPAK) badge in the
         // title's flex container — same horizontal band, same scale,
         // immediately visible at row-glance.
-        wrap.className = isCard ? 'px-4 pb-4 -mt-1' : 'flex-shrink-0';
+        //
+        // The card wrapper's padding has to match the host card body so the
+        // full-width button lines up with the title/tags above it: v2 cards
+        // wrap their body in a `.p-4` block, so we mirror that horizontal inset
+        // (`px-4`); v3 ("fee[dB]ack") card bodies are flush to the card edge, so
+        // the same `px-4` would over-inset and the button would render narrower
+        // than everything else — there we just add a top margin.
+        wrap.className = isCard
+            ? (isV3Card(node) ? 'mt-2' : 'px-4 pb-4 -mt-1')
+            : 'flex-shrink-0';
         this._fillFixUI(wrap, filename, isCard);
         if (isCard) {
             // Append to the card itself; placement after p-4 puts the
@@ -950,7 +956,7 @@ export class PreviewBackfill {
     _refreshFixUI(node, filename) {
         const wrap = node.querySelector('[data-fix-missing-preview]');
         if (!wrap) return;
-        const isCard = node.classList.contains('song-card');
+        const isCard = isGridCard(node);
         this._fillFixUI(wrap, filename, isCard);
     }
 
