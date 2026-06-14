@@ -102,6 +102,10 @@ export function artElement(card) {
     if (!card || !card.querySelector) return null;
     const legacyArt = card.querySelector('.card-art');
     if (legacyArt) return legacyArt;
+    // v3 list/tree rows (#v3-songs-tree) have no art square — trace the row
+    // itself. Decide by CONTAINER, not by the inner [data-v3-play] tag shape,
+    // which isn't reliable across host builds.
+    if (card.closest && card.closest('#v3-songs-tree')) return null;
     const v3play = card.querySelector('[data-v3-play]');
     if (v3play && v3play.tagName === 'DIV') return v3play;
     // v3 dashboard tiles: the recently-played card wraps its art in an inner
@@ -123,15 +127,26 @@ export function isV3Card(card) {
 }
 
 // True for grid cards (album-art square), false for list rows. Drives touch
-// button placement (overlay on art vs inline beside the title). Dashboard tiles
-// are art-square cards too.
+// button placement (overlay on art vs inline beside the title) and the progress
+// ring anchor. Dashboard tiles are art-square cards too.
 export function isGridCard(card) {
     if (!card) return false;
-    if (card.classList && card.classList.contains('song-card')) return true;
-    const v3play = card.querySelector ? card.querySelector('[data-v3-play]') : null;
-    if (v3play && v3play.tagName === 'DIV') return true;
+    if (card.classList && card.classList.contains('song-card')) return true; // v2 grid
     const id = card.id || '';
-    return !!((card.hasAttribute && card.hasAttribute('data-recent')) || id === 'v3-continue' || id === 'v3-pick');
+    if ((card.hasAttribute && card.hasAttribute('data-recent')) || id === 'v3-continue' || id === 'v3-pick') return true; // dashboard tiles
+    // Decide by CONTAINER — grid cards in #v3-songs-grid, list rows in
+    // #v3-songs-tree. This is called per-node in the touch/backfill decorate
+    // loops, which run over the WHOLE library at once in tree view (~thousands
+    // of rows). It must NOT read layout (clientWidth/getComputedStyle): a layout
+    // read after each button injection forces a synchronous reflow, and thousands
+    // of them froze the first list-view preview for ~15s. `closest()` is pure DOM
+    // traversal — no reflow.
+    if (card.closest) {
+        if (card.closest('#v3-songs-grid')) return true;
+        if (card.closest('#v3-songs-tree')) return false;
+    }
+    const v3play = card.querySelector ? card.querySelector('[data-v3-play]') : null;
+    return !!(v3play && v3play.tagName === 'DIV');
 }
 
 // True for the v3 dashboard hero card (Continue-Playing / Pick-a-song). Its art
