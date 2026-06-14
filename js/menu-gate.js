@@ -5,15 +5,22 @@
 // focus on a select after a pick).
 export class MenuGate {
     constructor() {
-        this.GATED_SELECT_IDS = ['lib-format', 'lib-sort', 'fav-sort'];
+        // v2 library/favorites selects, plus the v0.3.0 ("fee[dB]ack") Songs
+        // screen's provider/sort/format selects.
+        this.GATED_SELECT_IDS = [
+            'lib-format', 'lib-sort', 'fav-sort',
+            'v3-songs-provider', 'v3-songs-sort', 'v3-songs-format',
+        ];
         this._openSelectIds = new Set();
         this._handlers = new WeakMap();
 
         // getElementById is cheap but isAnyMenuOpen is called every rAF
-        // tick (~60/sec), so three lookups per tick = 180/sec when idle.
+        // tick (~60/sec), so each lookup per tick adds up when idle.
         // Cache element refs and invalidate when the DOM mutates (the
         // bootstrap's MutationObserver calls invalidateCache()).
-        this._WATCHED_IDS = ['plugin-dropdown', 'lib-filter-drawer', 'tuner-plugin-ui'];
+        // `v3-songs-overlay` is the dimmer behind the v3 Songs filter drawer
+        // (shown together with it).
+        this._WATCHED_IDS = ['plugin-dropdown', 'lib-filter-drawer', 'tuner-plugin-ui', 'v3-songs-overlay'];
         this._cachedEls = null;
     }
 
@@ -59,6 +66,13 @@ export class MenuGate {
         if (this._openSelectIds.size > 0) return true;
         const tuner = els['tuner-plugin-ui'];
         if (tuner && !tuner.classList.contains('hidden')) return true;
+        // v3 Songs filter drawer: its overlay is only in the DOM (un-hidden)
+        // while the drawer is open.
+        const v3Overlay = els['v3-songs-overlay'];
+        if (v3Overlay && !v3Overlay.classList.contains('hidden')) return true;
+        // v3 per-card "⋮" action menu — transient, class-based (no stable id),
+        // so a direct query rather than the cached id map.
+        if (document.querySelector('.v3-card-menu')) return true;
         return false;
     }
 

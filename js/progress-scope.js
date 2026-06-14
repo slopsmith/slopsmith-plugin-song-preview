@@ -9,11 +9,18 @@
 // same loop visual, just a long thin rectangle instead of a square. Both
 // also get a `song-preview-playing` class so the active item can be tinted
 // (a thin perimeter alone is easy to miss on a dense list).
+import { artElement } from './host-adapter.js';
+
 const PLAYING_STYLE_ID = 'song-preview-playing-styles';
+// v2 list rows are `.song-row`; v3 (#v3-songs) tree rows are `[data-fn]` nodes
+// inside #v3-songs-tree. Tint both the same way so the sounding row stands out.
+// Playing-row highlight: a faint accent tint only. The progress itself is the
+// bottom bar drawn in draw() — no left edge bar (that ran the full height of the
+// row up to the top edge, which read as "appearing above the edge").
 const PLAYING_STYLES = `
-.song-row.song-preview-playing{
-    background: rgba(64, 128, 224, 0.14);
-    box-shadow: inset 3px 0 0 rgb(var(--sm-accent, 64, 128, 224));
+.song-row.song-preview-playing,
+#v3-songs-tree [data-fn].song-preview-playing{
+    background: rgba(var(--sm-accent, 64, 128, 224), 0.10);
 }`;
 function _ensurePlayingStyles() {
     if (typeof document === 'undefined' || document.getElementById(PLAYING_STYLE_ID)) return;
@@ -172,13 +179,19 @@ export class ProgressScope {
 
     attach(host) {
         this.detach();
-        // Cards trace their album-art square; rows have no art, so trace the
-        // row's own rounded rect.
-        let art = host && host.querySelector ? host.querySelector('.card-art') : null;
-        if (!art && host && host.classList && host.classList.contains('song-row')) {
-            art = host;
-        }
-        if (!art) return; // nothing paintable (e.g. a card mid-render)
+        // Row vs card by the host's SHAPE, not its markup. Container ids and
+        // inner [data-v3-play] tags vary across host builds, so sniffing them
+        // misclassified rows (→ perimeter loop with a stray top edge). At
+        // play-time the host is laid out, so a list row (far wider than tall)
+        // vs a grid card / square tile (portrait or square) is unambiguous.
+        const hw = (host && host.clientWidth) || 0;
+        const hh = (host && host.clientHeight) || 0;
+        const isRow = hw > 0 && hh > 0 && hw > hh * 2;
+        // Rows trace the row itself (bottom bar in draw()); cards ring their
+        // album-art square. A card with no resolvable art is mid-render — skip
+        // it (next tick re-attaches) rather than ring the whole card.
+        const art = isRow ? host : artElement(host);
+        if (!art) return;
 
         // Tint the playing item so it's obvious which one is sounding.
         if (host && host.classList) host.classList.add('song-preview-playing');
@@ -198,10 +211,14 @@ export class ProgressScope {
 
         // Everything draw() needs lives on the scope object — we no longer
         // run our own rAF, PreviewLoop calls draw() from its shared tick.
+        // `isRow` switches draw() to a bottom progress bar: a perimeter loop on
+        // a wide, thin list row is dominated by its long horizontal edges and
+        // reads as stray lines, so rows get a clean left→right bar instead.
         this._scope = {
             canvas,
             art,
             host,
+            isRow,
             ctx2d: canvas.getContext('2d'),
             stroke,
             inset,
@@ -227,12 +244,29 @@ export class ProgressScope {
         const dur = audio && Number.isFinite(audio.duration) ? audio.duration : 0;
         const cur = audio ? audio.currentTime : 0;
         const progress = dur > 0 ? Math.min(1, Math.max(0, cur / dur)) : 0;
-        const { canvas, ctx2d, stroke, inset, radii, accent } = s;
+        const { canvas, ctx2d, stroke, inset, radii, accent, isRow } = s;
         const w = canvas.width;
         const h = canvas.height;
+        ctx2d.clearRect(0, 0, w, h);
+
+        // List rows: a thin progress bar pinned to the bottom edge, full-width
+        // faint track + left→right accent fill. Reads cleanly at any row width,
+        // unlike a perimeter loop.
+        if (isRow) {
+            const barH = stroke;
+            const y = h - barH;
+            // Visible track (a faint dark track vanished on the dark row, so the
+            // lone accent fill read as a stray mark). Full-width track + accent
+            // fill = an obvious progress bar.
+            ctx2d.fillStyle = 'rgba(255,255,255,0.16)';
+            ctx2d.fillRect(0, y, w, barH);
+            ctx2d.fillStyle = accent;
+            ctx2d.fillRect(0, y, Math.round(w * progress), barH);
+            return;
+        }
+
         const innerW = w - stroke;
         const innerH = h - stroke;
-        ctx2d.clearRect(0, 0, w, h);
         ctx2d.lineWidth = stroke;
         ctx2d.lineCap = 'butt';
         ctx2d.lineJoin = 'round';

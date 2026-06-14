@@ -2,7 +2,10 @@
     <button onclick="showScreen('home')" class="text-gray-500 hover:text-white text-sm mb-6 flex items-center gap-1">
         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg> Back
     </button>
-    <h2 class="text-3xl font-bold text-white mb-2">Song Preview</h2>
+    <div class="flex items-baseline gap-2 mb-2">
+        <h2 class="text-3xl font-bold text-white">Song Preview</h2>
+        <span class="text-sm font-medium text-gray-500" data-song-preview-version></span>
+    </div>
     <p class="text-sm text-gray-500 mb-6">Plays a short clip of a song when you hover over it in your library. Songs that are missing a preview clip can be fixed below.</p>
 
     <div class="bg-dark-700/40 border border-gray-800 rounded-xl p-5 mt-6">

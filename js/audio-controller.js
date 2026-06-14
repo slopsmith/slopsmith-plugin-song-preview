@@ -40,6 +40,20 @@ export class AudioController {
         // picked up without a page reload.
         this._noPreviewFiles = new Set();
 
+        // iOS ignores HTMLMediaElement.volume entirely (loudness is hardware-only
+        // there), so the preview-volume slider was a no-op on iPhone/iPad. On
+        // touch devices we therefore route playback through a Web Audio
+        // GainNode, whose gain IS respected on iOS and Android. Desktop keeps the
+        // simpler element-volume path: hover-triggered playback isn't a user
+        // gesture, so it can't reliably resume a (possibly suspended) AudioContext.
+        this._useWebAudio = (() => {
+            try { return window.matchMedia('(hover: none) and (pointer: coarse)').matches; }
+            catch (_) { return false; }
+        })();
+        this._audioCtx = null;
+        this._sourceNode = null;
+        this._gainNode = null;
+
         // Preview volume is the plugin's own level (see VOLUME_KEY), decoupled
         // from the host Song channel. Cross-tab drags fire 'storage'; same-tab
         // changes call setVolume() directly, and start() re-applies it so the
@@ -104,7 +118,41 @@ export class AudioController {
     }
 
     _applyVolume() {
-        if (this._audio) this._audio.volume = this._volume;
+        // Touch: control loudness via the Web Audio gain (element volume is a
+        // no-op on iOS). Pin the element to unity so it's the gain alone — on
+        // Android, where element volume also works, the two would multiply.
+        if (this._gainNode) {
+            try { this._gainNode.gain.value = this._volume; } catch (_) {}
+            if (this._audio) { try { this._audio.volume = 1; } catch (_) {} }
+            return;
+        }
+        if (this._audio) { try { this._audio.volume = this._volume; } catch (_) {} }
+    }
+
+    // Route the preview <audio> through a GainNode so the volume slider works on
+    // iOS (where <audio>.volume is ignored). Best-effort: on any failure we fall
+    // back to element volume. Touch devices only — see the constructor note.
+    _setupWebAudio(audio) {
+        try {
+            const Ctx = window.AudioContext || window.webkitAudioContext;
+            if (!Ctx) return;
+            const ctx = new Ctx();
+            // createMediaElementSource may be called only ONCE per element, and
+            // afterwards the element's audio flows ONLY through this graph — so we
+            // must connect to the destination or playback goes silent.
+            const source = ctx.createMediaElementSource(audio);
+            const gain = ctx.createGain();
+            gain.gain.value = this._volume;
+            source.connect(gain);
+            gain.connect(ctx.destination);
+            this._audioCtx = ctx;
+            this._sourceNode = source;
+            this._gainNode = gain;
+        } catch (_) {
+            this._audioCtx = null;
+            this._sourceNode = null;
+            this._gainNode = null;
+        }
     }
 
     _ensureAudio() {
@@ -160,6 +208,7 @@ export class AudioController {
         }
 
         this._audio = audio;
+        if (this._useWebAudio) this._setupWebAudio(audio);
         return audio;
     }
 
@@ -176,6 +225,13 @@ export class AudioController {
         // injection so the new clip plays immediately after Fix.
         if (this._noPreviewFiles.has(filename)) return;
         const audio = this._ensureAudio();
+
+        // A suspended AudioContext (autoplay policy) plays silently — resume it.
+        // On touch, start() runs inside the tap handler, so this is a valid user
+        // gesture for resume().
+        if (this._audioCtx && this._audioCtx.state === 'suspended') {
+            this._audioCtx.resume().catch(() => {});
+        }
 
         // Cut off whatever was playing before. Emit stop so the old scope
         // detaches; the new one attaches on the upcoming 'play' event.
@@ -230,6 +286,12 @@ export class AudioController {
                 this._audio.remove();
             } catch (_) {}
             this._audio = null;
+        }
+        if (this._audioCtx) {
+            try { this._audioCtx.close(); } catch (_) {}
+            this._audioCtx = null;
+            this._sourceNode = null;
+            this._gainNode = null;
         }
         this._externalAudioActive = false;
         for (const k of Object.keys(this._listeners)) this._listeners[k].length = 0;
