@@ -4,6 +4,7 @@
   "version": "2.2.0",
   "description": "Hear a preview of songs in your library as you browse — hover on desktop, tap on touch.",
   "category": "audio",
+  "icon": "assets/thumb.svg",
   "routes": "routes.py",
   "script": "screen.js",
   "screen": "screen.html",
